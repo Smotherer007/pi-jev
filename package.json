@@ -1,0 +1,60 @@
+{
+  "name": "@patimweb/pi-jev",
+  "version": "0.1.0",
+  "description": "Typed decision layer for the pi coding agent. Jev answers bounded questions with calibrated probabilities, so pi filters, verifies and gates cheaply instead of spending frontier tokens and turns on it.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "jev",
+    "typesafe",
+    "system-one",
+    "decision",
+    "calibration",
+    "triage",
+    "verification",
+    "token-optimization",
+    "guardrail",
+    "confidence"
+  ],
+  "author": "Patrick Weppelmann",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Smotherer007/pi-jev.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Smotherer007/pi-jev/issues"
+  },
+  "scripts": {
+    "test": "node --experimental-test-module-mocks --experimental-test-coverage --test 'tests/**/*.test.ts'",
+    "test:watch": "node --experimental-test-module-mocks --test --watch 'tests/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@semantic-release/git": "^10.0.0",
+    "@semantic-release/npm": "^13.0.0",
+    "@types/node": "^24.0.0",
+    "semantic-release": "^25.0.0",
+    "typebox": "^1.3.0",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/Smotherer007/pi-jev/main/screenshot.png"
+  }
+}
