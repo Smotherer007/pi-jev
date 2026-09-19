@@ -1,6 +1,6 @@
 {
   "name": "@patimweb/pi-jev",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Typed decision layer for the pi coding agent. Jev answers bounded questions with calibrated probabilities, so pi filters, verifies and gates cheaply instead of spending frontier tokens and turns on it.",
   "keywords": [
     "pi-package",
