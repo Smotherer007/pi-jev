@@ -197,7 +197,7 @@ way to know is to write down what happened.
 | **A search engine** | It needs the questions defined in advance. Open-ended "find out why X happens" is not a decision. |
 | **A guardrail on its own** | The rules catch the unambiguous; the model refines the rest. Neither is a sandbox and neither is a permission system. |
 | **Free** | Jev is roughly $0.042 per million input tokens with free output. Local models cost nothing but take seconds — fine for triage, too slow for the gate. |
-| **A way to save money on a cheap model** | At a few cents per million tokens the token saving is a rounding error, and the ledger will say so. What remains is context precision, latency, and the guard — which costs nothing and works with no provider at all. |
+| **A way to save money on a cheap model** | At a few cents per million tokens the token saving is a rounding error, and the ledger will say so. What remains is context precision, latency, and the guard — which costs nothing and works with no provider at all. Every tool you keep also costs prompt surface and a place in the model's tool choice, so drop the ones you do not use: `pi -xt jev_verify,jev_decide` still leaves triage, the guard and the ledger. |
 | **Verified against a live account** | See below. |
 
 ### The API contract, as verified
