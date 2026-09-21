@@ -8,6 +8,7 @@ import * as path from "node:path";
 
 import extension from "../index.ts";
 import { _resetConfigCache } from "../src/config.ts";
+import { _resetDropMemory, readLedger, rememberDrops } from "../src/ledger.ts";
 
 /**
  * A stand-in for pi's ExtensionAPI, recording what the extension registers.
@@ -87,6 +88,8 @@ beforeEach(() => {
   // The config is cached per process, so each test needs it dropped or it would
   // keep reading the previous test's HOME.
   _resetConfigCache();
+  // Same for the dropped-path memory, which is what shadow-miss matching reads.
+  _resetDropMemory();
   notifications = [];
   statuses = [];
 });
@@ -335,6 +338,52 @@ describe("shadow-miss detection", () => {
     await handler({ toolName: "read", input: {} }, fakeContext(home));
     await handler({ toolName: "read" }, fakeContext(home));
     await handler({ toolName: "grep", input: { path: 42 } }, fakeContext(home));
+  });
+
+  /** Shadow mode on, with a triage run's drops already in memory. */
+  function withShadowOn(): { pi: FakePi; root: string; cwd: string } {
+    const configPath = path.join(home, ".pi", "jev-config.json");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ shadow: { triage: true } }), "utf-8");
+    _resetConfigCache();
+
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    return { pi, root: path.join(home, "project", "src"), cwd: path.join(home, "project") };
+  }
+
+  function shadowMisses() {
+    return readLedger().filter((entry) => entry.kind === "shadow-miss");
+  }
+
+  it("records a miss when the agent reads a file the filter had withheld", async () => {
+    // This is the wiring the whole measurement rests on: shadow mode on, a drop
+    // key resolved against the root triage used, and an entry in the ledger.
+    const { pi, root, cwd } = withShadowOn();
+    rememberDrops("dec_read", ["candidates.ts", "format.ts"], "jev_triage", root);
+
+    await toolCallHandler(pi, "shadow")({ toolName: "read", input: { path: "src/candidates.ts" } }, { ...fakeContext(home), cwd });
+
+    const misses = shadowMisses();
+    assert.equal(misses.length, 1, "a read of a withheld file must be recorded");
+    assert.equal((misses[0] as { item?: string }).item, "candidates.ts");
+  });
+
+  it("records nothing when the file that was read only shares a name", async () => {
+    // A false hit here inflates the number that decides whether keeping the
+    // filter is justifiable, which is worse than a miss.
+    const { pi, root } = withShadowOn();
+    rememberDrops("dec_read", ["types.ts"], "jev_triage", root);
+    const handler = toolCallHandler(pi, "shadow");
+
+    await handler(
+      { toolName: "read", input: { path: "/somewhere/else/packages/api/src/types.ts" } },
+      { ...fakeContext(home), cwd: path.join(home, "elsewhere") },
+    );
+    // And a file the filter kept is not a miss either.
+    await handler({ toolName: "read", input: { path: "src/questions.ts" } }, { ...fakeContext(home), cwd: path.join(home, "project") });
+
+    assert.deepEqual(shadowMisses(), []);
   });
 });
 
