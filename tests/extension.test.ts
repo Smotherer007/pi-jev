@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -381,5 +383,172 @@ describe("tool invocation without a provider", () => {
     assert.equal(result.details.source, "unavailable");
     assert.match(result.content[0]?.text ?? "", /could not be reached/);
     assert.match(result.content[0]?.text ?? "", /not a fail-open path/);
+  });
+});
+
+/* ------------------------------------------------- the model layer, live */
+
+/**
+ * A stub standing in for the decision endpoint, answering in the shape the live
+ * API returns.
+ *
+ * `respond` receives the parsed request body and returns the response body, so
+ * a test can answer in whichever shape the provider under test expects: the Jev
+ * endpoint's own, or an OpenAI-compatible chat completion.
+ *
+ * The score question is the whole point of these tests. A score's levels must
+ * travel as an ordered list, because a map is refused with HTTP 422 — and
+ * `jev_gate` always asks for one, so that single detail is the difference
+ * between a gate that classifies an ambiguous action and one that can only ever
+ * say "the classifier could not be reached".
+ */
+async function withDecisionStub(
+  respond: (body: Record<string, unknown>) => unknown,
+  run: (baseUrl: string, bodies: Array<Record<string, unknown>>) => Promise<void>,
+): Promise<void> {
+  const bodies: Array<Record<string, unknown>> = [];
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => {
+      raw += chunk;
+    });
+    request.on("end", () => {
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      bodies.push(body);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(respond(body)));
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${port}/v1`, bodies);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+/** The response shape api.typesafe.ai/v1/systemone answers with. */
+const jevResponse = (answers: Record<string, unknown>) => (): unknown => ({
+  model: "jev-1.13.0",
+  answers,
+  usage: { input_tokens: 120, output_tokens: 20 },
+});
+
+/** The response shape an OpenAI-compatible endpoint answers with. */
+const compatResponse = (answers: Record<string, unknown>) => (): unknown => ({
+  model: "stub",
+  choices: [{ message: { content: JSON.stringify({ answers }) } }],
+  usage: { prompt_tokens: 120, completion_tokens: 20 },
+});
+
+/** Point the extension at the stub, optionally with its own gate policy. */
+function writeStubConfig(url: string, kind: "jev" | "openai-compat", gate?: Record<string, string>): void {
+  const configPath = path.join(home, ".pi", "jev-config.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      providers: [{ id: "stub", kind, baseUrl: url, model: "stub", apiKey: "x", jsonMode: false }],
+      limits: { gateTimeoutMs: 2_000 },
+      ...(gate ? { gate } : {}),
+    }),
+    "utf-8",
+  );
+  _resetConfigCache();
+}
+
+function callGate(pi: FakePi, action: string) {
+  const gate = pi.tools.get("jev_gate") as {
+    execute: (id: string, params: unknown, signal: undefined, update: undefined, ctx: unknown) => Promise<{
+      content: Array<{ text: string }>;
+      details: Record<string, unknown>;
+    }>;
+  };
+  return gate.execute("call1", { action }, undefined, undefined, fakeContext(home));
+}
+
+const STUB_ANSWERS = {
+  risk: {
+    type: "choice",
+    choice: "reversible",
+    confidence: 0.8,
+    probabilities: { read_only: 0.05, reversible: 0.8, destructive: 0.1, needs_human: 0.05 },
+  },
+  blast: {
+    type: "score",
+    score: 2.6,
+    confidence: 0.7,
+    legend: { 0: "a", 1: "b", 2: "c", 3: "d" },
+    probabilities: { 0: 0, 1: 0.05, 2: 0.4, 3: 0.55 },
+  },
+};
+
+describe("jev_gate against a reachable decision model", () => {
+  it("sends a score's levels as an ordered list and reads the level back as a blast radius", async () => {
+    await withDecisionStub(jevResponse(STUB_ANSWERS), async (url, bodies) => {
+      writeStubConfig(url, "jev");
+      const pi = makeFakePi();
+      extension(pi.api as never);
+
+      // The rules deliberately decline to judge this one, so it reaches layer 2.
+      const result = await callGate(pi, "./scripts/migrate.sh");
+
+      assert.equal(result.details.source, "model");
+      assert.equal(result.details.risk, "reversible");
+      // The distribution's peak is level 3, which is the level named "4".
+      assert.equal(result.details.blast, 4);
+      // A blast radius of 4 escalates the configured "confirm".
+      assert.equal(result.details.verdict, "block");
+
+      // The request the endpoint actually receives. Sent as a map, this is HTTP
+      // 422 and every ambiguous action falls back to "could not be reached".
+      const questions = bodies[0]?.questions as Record<string, { criteria?: unknown }>;
+      const blastCriteria = questions.blast?.criteria;
+      assert.ok(Array.isArray(blastCriteria), "a score's levels must go out as an ordered list, not a map");
+      assert.equal(blastCriteria.length, 4);
+      assert.ok(blastCriteria.every((level) => typeof level === "string"));
+      // A choice keeps its map, because that is what names its options.
+      const riskCriteria = questions.risk?.criteria;
+      assert.ok(riskCriteria !== undefined && !Array.isArray(riskCriteria));
+    });
+  });
+
+  it("enforces allowedRisk in the model layer instead of only mentioning it", async () => {
+    const lowBlast = {
+      risk: STUB_ANSWERS.risk,
+      blast: { type: "score", score: 0.05, confidence: 0.95, probabilities: { 0: 0.95, 1: 0.05, 2: 0, 3: 0 } },
+    };
+
+    await withDecisionStub(compatResponse(lowBlast), async (url) => {
+      // A policy that would clear a reversible action on its own.
+      writeStubConfig(url, "openai-compat", {
+        read_only: "allow",
+        reversible: "allow",
+        destructive: "block",
+        needs_human: "confirm",
+      });
+      const pi = makeFakePi();
+      extension(pi.api as never);
+
+      const result = await callGate(pi, "./scripts/migrate.sh");
+
+      assert.equal(result.details.risk, "reversible");
+      assert.equal(result.details.blast, 1);
+      // The configured policy says allow; the ceiling the caller set does not.
+      assert.equal(result.details.verdict, "confirm");
+      assert.match(result.content[0]?.text ?? "", /above the allowedRisk you set \(read_only\)/i);
+    });
+  });
+
+  it("does not let a wide allowedRisk downgrade a rule that blocks", async () => {
+    // No stub needed: the rules answer before any provider is consulted, which
+    // is exactly why a caller cannot talk their way out of one.
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const result = await callGate(pi, "rm -rf /");
+    assert.equal(result.details.source, "rule");
+    assert.equal(result.details.verdict, "block");
   });
 });

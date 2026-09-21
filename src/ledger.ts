@@ -163,7 +163,7 @@ export function readLedger(limit?: number): LedgerEntry[] {
   const slice = limit !== undefined && lines.length > limit ? lines.slice(-limit) : lines;
 
   const entries: LedgerEntry[] = [];
-  for (const line of lines.length !== slice.length ? slice : lines) {
+  for (const line of slice) {
     try {
       const parsed = JSON.parse(line) as LedgerEntry;
       if (parsed && typeof parsed === "object" && "kind" in parsed) entries.push(parsed);

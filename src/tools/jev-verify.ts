@@ -128,6 +128,12 @@ export const JevVerifyTool = {
 
     if (params.claims.length === 0) throw new Error("At least one claim is required.");
 
+    // Resolved once, so the ledger and the output cannot disagree about whether
+    // this decision was made in shadow mode — /jev-calibration splits on that
+    // flag, and a decision logged as trusted while the tool told the agent to
+    // distrust it corrupts exactly the measurement the ledger exists for.
+    const shadow = params.shadow ?? config.shadow.verify;
+
     const evidence = await gatherEvidence(params, ctx.cwd, config.limits.maxStateChars);
 
     if (evidence.text.trim().length === 0) {
@@ -165,7 +171,7 @@ export const JevVerifyTool = {
       purpose: `verify ${params.claims.length} claim(s)`.slice(0, 180),
       state,
       questions,
-      ...(params.shadow !== undefined ? { shadow: params.shadow } : {}),
+      shadow,
       ...(params.provider ? { providerId: params.provider } : {}),
       signal,
     });
@@ -181,7 +187,7 @@ export const JevVerifyTool = {
       latencyMs: outcome.latencyMs,
       costUsd: outcome.costUsd,
       evidenceChars: evidence.text.length,
-      shadow: outcome.decisionId ? (params.shadow ?? config.shadow.verify) : false,
+      shadow,
       decisionId: outcome.decisionId,
       degraded: outcome.degraded,
     });
