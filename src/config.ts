@@ -64,6 +64,23 @@ export interface JevConfig {
     refutedAt: number;
   };
   gate: Record<RiskClass, GateVerdict>;
+  /**
+   * The deterministic rules, enforced rather than offered.
+   *
+   * `jev_gate` is advice: it fires only when the model chooses to ask, and a
+   * model that has already decided to run a command is not the party you want
+   * asking on its own behalf. The rules in `guard.ts` need no provider, no key
+   * and no network, so there is nothing to weigh against applying them to every
+   * shell command before it runs.
+   */
+  hook: {
+    /**
+     * Apply `hardGuard` to every `bash` call and act on its verdict before the
+     * command runs. Turn it off to go back to the gate being a tool the model
+     * may or may not call.
+     */
+    bash: boolean;
+  };
   shadow: {
     triage: boolean;
     verify: boolean;
@@ -103,6 +120,9 @@ export function defaultConfig(): JevConfig {
       reversible: "confirm",
       destructive: "block",
       needs_human: "confirm",
+    },
+    hook: {
+      bash: true,
     },
     shadow: {
       triage: false,
@@ -158,6 +178,7 @@ function mergeConfig(raw: unknown): JevConfig {
     limits: { ...base.limits, ...(input.limits ?? {}) },
     verify: { ...base.verify, ...(input.verify ?? {}) },
     gate: normaliseGate(input.gate, base.gate),
+    hook: normaliseHook(input.hook, base.hook),
     shadow: { ...base.shadow, ...(input.shadow ?? {}) },
     ledger: { ...base.ledger, ...(input.ledger ?? {}) },
   };
@@ -183,6 +204,16 @@ function normaliseGate(input: unknown, fallback: Record<RiskClass, GateVerdict>)
     if (value === "allow" || value === "confirm" || value === "block") out[risk] = value;
   }
   return out;
+}
+
+/**
+ * Only a real boolean counts, so `"false"` cannot quietly leave the hook on and
+ * an unexpected value cannot quietly turn it off.
+ */
+function normaliseHook(input: unknown, fallback: { bash: boolean }): { bash: boolean } {
+  if (!input || typeof input !== "object") return { ...fallback };
+  const raw = input as Record<string, unknown>;
+  return { bash: typeof raw.bash === "boolean" ? raw.bash : fallback.bash };
 }
 
 export function loadConfig(): JevConfig {

@@ -23,6 +23,8 @@
  * answer from the agent.
  */
 
+import * as path from "node:path";
+
 import { Type } from "typebox";
 
 import { getConfig } from "../config.ts";
@@ -52,17 +54,21 @@ interface TriageParams {
 /** How many noul questions share one provider call. */
 const DEFAULT_QUESTIONS_PER_CALL = 40;
 
-function questionFor(index: number, candidate: Candidate, params: TriageParams): QuestionSpec {
+export function questionFor(index: number, candidate: Candidate, params: TriageParams): QuestionSpec {
   return {
     id: `c${index}`,
     type: "noul",
     instructions:
       `Does candidate \`${candidate.key}\` matter for this question: ${params.question}? ` +
-      "Judge only what the excerpt shows. Answer false when the excerpt is too thin to tell: " +
-      "a wrong keep costs one file read, a wrong drop costs the answer.",
+      "Judge only what the excerpt shows. The two possible mistakes do not cost the same: " +
+      "keeping a candidate that did not matter costs one file read, while dropping one that did " +
+      "costs the answer. So when the excerpt is too thin to tell, answer true and let the reader " +
+      "decide.",
     criteria: {
-      true: params.criteria ?? "The excerpt shows this candidate is relevant to the question.",
-      false: "The candidate is not relevant, or the excerpt is too thin to tell.",
+      true:
+        params.criteria ??
+        "The excerpt shows this candidate is relevant to the question, or it is too thin to rule it out.",
+      false: "The excerpt shows this candidate is not relevant to the question.",
     },
   };
 }
@@ -135,6 +141,10 @@ export const JevTriageTool = {
     const minConfidence = params.minConfidence ?? config.limits.minConfidence;
     const shadow = params.shadow ?? config.shadow.triage;
     const questionsPerCall = Math.max(1, params.questionsPerCall ?? DEFAULT_QUESTIONS_PER_CALL);
+    // What the candidate keys are relative to. An explicit `items` list is not
+    // made of paths, so there is no root to resolve those against.
+    const searchRoot =
+      params.items && params.items.length > 0 ? undefined : path.resolve(ctx.cwd, params.root ?? ".");
 
     /* ------------------------------------------------------ candidates */
 
@@ -195,8 +205,8 @@ export const JevTriageTool = {
       const questions = chunk.map((candidate, index) => questionFor(offset + index, candidate, params));
       const stateText = renderCandidatesForState(chunk, config.limits.maxStateChars);
 
-      let chunkKept: string[] = [];
-      let chunkDropped: string[] = [];
+      const chunkKept: string[] = [];
+      const chunkDropped: string[] = [];
 
       try {
         const outcome = await decide({
@@ -265,7 +275,9 @@ export const JevTriageTool = {
     const allDrops = ranked.filter((row) => !row.keep).map((row) => row.item.key);
 
     if (shadow && allDrops.length > 0 && decisions.length > 0) {
-      rememberDrops(decisions[decisions.length - 1] ?? "unknown", allDrops, "jev_triage");
+      // The search root travels with the drops, so a later read can be resolved
+      // against the same directory the keys are relative to.
+      rememberDrops(decisions[decisions.length - 1] ?? "unknown", allDrops, "jev_triage", searchRoot);
     }
 
     const text = formatTriage(rows, {

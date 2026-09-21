@@ -193,9 +193,43 @@ describe("shadow-miss detection", () => {
     assert.ok(findShadowMiss("src/auth.ts"));
   });
 
-  it("matches on basename when the directories differ", () => {
-    rememberDrops("dec_1", ["lib/auth.ts"], "jev_triage");
-    assert.ok(findShadowMiss("src/auth.ts"));
+  it("does not report a miss just because two files share a name", () => {
+    // A file name is not an identity: `index.ts`, `types.ts` and `README.md`
+    // appear several times over in most projects. Counting one as a miss for
+    // another inflates the only number that decides whether keeping the filter
+    // is justifiable.
+    rememberDrops("dec_1", ["src/tools/index.ts"], "jev_triage");
+    assert.equal(findShadowMiss("src/graph/index.ts"), null);
+
+    rememberDrops("dec_2", ["src/types.ts"], "jev_triage");
+    assert.equal(findShadowMiss("src/graph/types.ts"), null);
+  });
+
+  it("does not match a bare name against a path that ends with it", () => {
+    // Without a root nothing says whether `src/auth.ts` is the dropped `auth.ts`
+    // or a different file of the same name one directory over, so it does not
+    // count. With a root it does — see the resolution tests below.
+    rememberDrops("dec_1", ["auth.ts"], "jev_triage");
+    assert.equal(findShadowMiss("src/auth.ts"), null);
+  });
+
+  it("resolves both sides against a known root, so a bare key still matches", () => {
+    // A triage key is relative to the search root; the path a read carries is
+    // relative to the working directory or absolute. Resolving both is what makes
+    // the comparison mean anything.
+    rememberDrops("dec_1", ["auth.ts"], "jev_triage", "/home/pat/project/src");
+    assert.deepEqual(findShadowMiss("src/auth.ts", "/home/pat/project"), { decisionId: "dec_1", item: "auth.ts" });
+    assert.deepEqual(findShadowMiss("/home/pat/project/src/auth.ts", "/home/pat/project"), {
+      decisionId: "dec_1",
+      item: "auth.ts",
+    });
+  });
+
+  it("does not match across roots even when the trailing path agrees", () => {
+    // `src/types.ts` in another package is another file, and with the root known
+    // the comparison can say so instead of guessing from the suffix.
+    rememberDrops("dec_1", ["src/types.ts"], "jev_triage", "/home/pat/project");
+    assert.equal(findShadowMiss("/home/pat/other/packages/api/src/types.ts", "/home/pat/other"), null);
   });
 
   it("returns null for an item that was kept", () => {

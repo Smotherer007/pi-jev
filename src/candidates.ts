@@ -177,20 +177,90 @@ export function readTextFile(absolutePath: string, maxBytes = 200_000): string |
   }
 }
 
-function firstMeaningfulLines(text: string, maxLines: number, maxChars: number): string {
-  const lines: string[] = [];
-  let chars = 0;
+/**
+ * A line that declares something.
+ *
+ * What a file *is* lives in its declarations. That is the whole reason the
+ * preview is not simply "the first four non-empty lines": in a source file those
+ * are almost always imports and imports say nothing about whether the file
+ * matters. `import` is deliberately absent from this pattern for that reason.
+ */
+const DECLARATION =
+  /^\s*(export\s|declare\s|class\s|function\s|async\s+function\s|def\s|fn\s|func\s|struct\s|interface\s|type\s|enum\s|impl\s|trait\s|pub\s|public\s|private\s|protected\s|internal\s|module\s|package\s|const\s+\w+\s*=\s*(async\s*)?\(|let\s+\w+\s*=\s*(async\s*)?\(|@|describe\(|it\(|test\()/;
 
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line.length === 0) continue;
-    // Skip shebangs and licence banners, which say nothing about content.
-    if (line.startsWith("#!") || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) continue;
-    lines.push(line);
-    chars += line.length + 1;
-    if (lines.length >= maxLines || chars >= maxChars) break;
+/** Lines that carry no information about what a file is. */
+function isNoise(line: string): boolean {
+  const trimmed = line.trim();
+  return (
+    trimmed.length === 0 ||
+    trimmed.startsWith("#!") ||
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("/*") ||
+    trimmed.startsWith("*") ||
+    trimmed.startsWith("import ") ||
+    trimmed.startsWith("from ") ||
+    trimmed.startsWith("require(") ||
+    trimmed.startsWith("using ")
+  );
+}
+
+/**
+ * The excerpt handed to the provider for one candidate.
+ *
+ * The provider judges a candidate by nothing but this text, so a preview of four
+ * import lines makes every source file look identical and leaves the filter
+ * guessing — which is the failure mode triage cannot afford, because a wrong
+ * drop is silent. Three sources, in this order:
+ *
+ *   1. The lines that matched the caller's pattern, with a line of context.
+ *      They are the reason the file is in the list at all.
+ *   2. Lines that declare something.
+ *   3. The first plain lines, so a config file, a template or prose still gets
+ *      a preview rather than an empty one.
+ */
+export function filePreview(
+  text: string,
+  options: { matchedLines?: readonly number[]; maxLines?: number; maxChars?: number } = {},
+): string {
+  const maxLines = options.maxLines ?? 4;
+  const maxChars = options.maxChars ?? 400;
+  const lines = text.split("\n");
+  const chosen = new Set<number>();
+
+  const take = (index: number): void => {
+    if (index < 0 || index >= lines.length || chosen.size >= maxLines) return;
+    chosen.add(index);
+  };
+
+  for (const match of options.matchedLines ?? []) {
+    take(match - 2);
+    take(match - 1);
+    take(match);
   }
-  return lines.join("\n");
+
+  if (chosen.size < maxLines) {
+    for (const [index, line] of lines.entries()) {
+      if (DECLARATION.test(line)) take(index);
+      if (chosen.size >= maxLines) break;
+    }
+  }
+
+  if (chosen.size === 0) {
+    for (const [index, line] of lines.entries()) {
+      if (!isNoise(line)) take(index);
+      if (chosen.size >= maxLines) break;
+    }
+  }
+
+  const out: string[] = [];
+  let chars = 0;
+  for (const index of [...chosen].sort((a, b) => a - b)) {
+    const line = (lines[index] ?? "").trim();
+    if (chars + line.length > maxChars) break;
+    out.push(line);
+    chars += line.length + 1;
+  }
+  return out.join("\n");
 }
 
 export interface GenerateResult {
@@ -230,11 +300,11 @@ export function generateCandidates(options: GenerateOptions): GenerateResult {
     if (!regex) {
       const text = readTextFile(absolute);
       if (text === null) continue;
-      const preview = firstMeaningfulLines(text, 4, previewChars);
+      const preview = filePreview(text, { maxLines: 4, maxChars: previewChars });
       candidates.push({
         key: file,
         path: file,
-        preview: preview.length > 0 ? preview : "(no meaningful first lines)",
+        preview: preview.length > 0 ? preview : "(no declarations, and nothing plain enough to preview)",
         size: fs.statSync(absolute).size,
       });
       continue;
@@ -244,15 +314,19 @@ export function generateCandidates(options: GenerateOptions): GenerateResult {
     if (text === null) continue;
 
     const lines = text.split("\n");
-    let matchedFile = false;
+    // Where the pattern hit: those lines are the reason this file is in the
+    // list, so they are what the preview has to show.
+    const matchedLines: number[] = [];
 
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index] ?? "";
       regex.lastIndex = 0;
       if (!regex.test(line)) continue;
 
-      matchedFile = true;
-      if (!options.perLine) break;
+      if (!options.perLine) {
+        if (matchedLines.length < 6) matchedLines.push(index + 1);
+        continue;
+      }
 
       if (candidates.length >= maxCandidates) {
         truncated = true;
@@ -266,12 +340,12 @@ export function generateCandidates(options: GenerateOptions): GenerateResult {
       });
     }
 
-    if (matchedFile && !options.perLine) {
-      const preview = firstMeaningfulLines(text, 4, previewChars);
+    if (matchedLines.length > 0) {
+      const preview = filePreview(text, { matchedLines, maxLines: 4, maxChars: previewChars });
       candidates.push({
         key: file,
         path: file,
-        preview: preview.length > 0 ? preview : "(match inside a file with no readable preview)",
+        preview: preview.length > 0 ? preview : "(matched, but the surrounding lines are not previewable)",
         size: fs.statSync(absolute).size,
       });
     }
