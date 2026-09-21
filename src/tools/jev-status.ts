@@ -42,6 +42,9 @@ export async function describeStatus(params: StatusParams = {}): Promise<string>
   lines.push(
     `gate     read_only=${config.gate.read_only} reversible=${config.gate.reversible} destructive=${config.gate.destructive} needs_human=${config.gate.needs_human}`,
   );
+  lines.push(
+    `hook     bash=${config.hook.bash ? "on" : "off"}${config.hook.bash ? " (the deterministic rules run before every bash call)" : " (the rules are only consulted when jev_gate is called)"}`,
+  );
   lines.push("");
 
   if (config.providers.length === 0) {

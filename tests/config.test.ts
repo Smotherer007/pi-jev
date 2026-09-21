@@ -54,6 +54,12 @@ describe("defaults", () => {
     // Inverting this in a refactor would silently disarm the gate.
     assert.notEqual(defaultConfig().gate.destructive, "allow");
   });
+
+  it("runs the deterministic guard rules on every bash call without being asked", () => {
+    // A guardrail the model has to volunteer for is advice. This one needs no
+    // provider, no key and no network, so it is on by default.
+    assert.equal(defaultConfig().hook.bash, true);
+  });
 });
 
 describe("loadConfig", () => {
@@ -94,6 +100,16 @@ describe("loadConfig", () => {
     assert.equal(config.gate.destructive, "block");
     assert.equal(config.gate.read_only, "allow");
     assert.equal(config.gate.reversible, "confirm");
+  });
+
+  it("keeps the guard hook on when the config says something that is not a boolean", () => {
+    writeConfig({ hook: { bash: "yes" } });
+    assert.equal(loadConfig().hook.bash, true);
+  });
+
+  it("lets the config switch the guard hook off", () => {
+    writeConfig({ hook: { bash: false } });
+    assert.equal(loadConfig().hook.bash, false);
   });
 
   it("tightens file permissions to 0600 on load", () => {

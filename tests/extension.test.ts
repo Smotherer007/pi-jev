@@ -67,7 +67,7 @@ function fakeContext(cwd: string) {
       setStatus: (key: string, text: string | undefined) => {
         statuses.push({ key, text });
       },
-      confirm: async () => true,
+      confirm: async (_title: string, _message?: string) => true,
       select: async () => undefined,
       input: async () => undefined,
     },
@@ -104,6 +104,28 @@ const EXPECTED_TOOLS = [
   "jev_gate",
   "jev_label",
 ];
+
+/**
+ * The extension registers two `tool_call` handlers, and the order is part of the
+ * design: the guard goes first, because a dangerous command should be refused
+ * before anything else looks at it, and shadow-miss detection second, because it
+ * is bookkeeping. Tests reach for one through these helpers, so the coupling is
+ * stated once instead of guessed at in every test.
+ */
+type ToolCallHandler = (event: unknown, ctx: unknown) => Promise<unknown>;
+
+function toolCallHandler(pi: FakePi, which: "guard" | "shadow"): ToolCallHandler {
+  const handlers = pi.handlers.get("tool_call") ?? [];
+  const handler = which === "guard" ? handlers[0] : handlers[1];
+  assert.ok(handler, `no ${which} tool_call handler was registered`);
+  return handler as ToolCallHandler;
+}
+
+/** What a guard handler returns when it wants a call stopped. */
+interface BlockedCall {
+  block?: boolean;
+  reason?: string;
+}
 
 describe("extension factory", () => {
   it("loads without throwing", () => {
@@ -159,7 +181,9 @@ describe("extension factory", () => {
     const pi = makeFakePi();
     extension(pi.api as never);
     assert.equal(pi.handlers.get("session_start")?.length, 1);
-    assert.equal(pi.handlers.get("tool_call")?.length, 1);
+    // The guard and shadow-miss detection, in that order: a dangerous command is
+    // refused before anything else looks at it.
+    assert.equal(pi.handlers.get("tool_call")?.length, 2);
   });
 });
 
@@ -267,6 +291,19 @@ describe("commands", () => {
     assert.ok(statuses.some((entry) => entry.key === "jev-shadow" && entry.text?.includes("triage")));
   });
 
+  it("/jev-shadow none switches every flag off instead of on", async () => {
+    await runCommand("jev-shadow", "all on");
+    await runCommand("jev-shadow", "none");
+    const config = JSON.parse(fs.readFileSync(path.join(home, ".pi", "jev-config.json"), "utf-8"));
+    assert.deepEqual(config.shadow, { triage: false, verify: false, gate: false });
+  });
+
+  it("/jev-shadow none on still switches them on, because an explicit state wins", async () => {
+    await runCommand("jev-shadow", "none on");
+    const config = JSON.parse(fs.readFileSync(path.join(home, ".pi", "jev-config.json"), "utf-8"));
+    assert.deepEqual(config.shadow, { triage: true, verify: true, gate: true });
+  });
+
   it("/jev-providers prints the chain", async () => {
     await runCommand("jev-providers", "");
     assert.ok(notifications.some((text) => text.includes("pi-jev")));
@@ -277,14 +314,14 @@ describe("shadow-miss detection", () => {
   it("ignores tool calls whose name is unrelated", async () => {
     const pi = makeFakePi();
     extension(pi.api as never);
-    const handler = pi.handlers.get("tool_call")?.[0] as (e: unknown, c: unknown) => Promise<unknown>;
+    const handler = toolCallHandler(pi, "shadow");
     assert.doesNotReject(() => handler({ toolName: "ls", input: {} }, fakeContext(home)));
   });
 
   it("ignores a read when shadow mode is off, so nothing is misattributed", async () => {
     const pi = makeFakePi();
     extension(pi.api as never);
-    const handler = pi.handlers.get("tool_call")?.[0] as (e: unknown, c: unknown) => Promise<unknown>;
+    const handler = toolCallHandler(pi, "shadow");
     await handler({ toolName: "read", input: { path: "src/anything.ts" } }, fakeContext(home));
 
     const ledger = path.join(home, ".pi", "jev-ledger.jsonl");
@@ -294,10 +331,95 @@ describe("shadow-miss detection", () => {
   it("survives a tool call with no useful path", async () => {
     const pi = makeFakePi();
     extension(pi.api as never);
-    const handler = pi.handlers.get("tool_call")?.[0] as (e: unknown, c: unknown) => Promise<unknown>;
+    const handler = toolCallHandler(pi, "shadow");
     await handler({ toolName: "read", input: {} }, fakeContext(home));
     await handler({ toolName: "read" }, fakeContext(home));
     await handler({ toolName: "grep", input: { path: 42 } }, fakeContext(home));
+  });
+});
+
+describe("the guard hook on bash", () => {
+  it("blocks an unambiguously destructive command before it runs", async () => {
+    const pi = makeFakePi();
+    extension(pi.api as never);
+
+    const result = (await toolCallHandler(pi, "guard")(
+      { toolName: "bash", input: { command: "rm -rf /" } },
+      fakeContext(home),
+    )) as BlockedCall | undefined;
+
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /recursive force delete/);
+    // The model is told that a rule decided this, so rephrasing is not a way past it.
+    assert.match(result?.reason ?? "", /Local rules decided this/);
+  });
+
+  it("leaves what the rules cannot judge to the model, where jev_gate still has an answer", async () => {
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const handler = toolCallHandler(pi, "guard");
+
+    assert.equal(await handler({ toolName: "bash", input: { command: "./scripts/migrate.sh" } }, fakeContext(home)), undefined);
+    assert.equal(await handler({ toolName: "bash", input: { command: "git status" } }, fakeContext(home)), undefined);
+  });
+
+  it("asks about danger it is not certain of, and refuses when the user says no", async () => {
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const ctx = fakeContext(home);
+    const asked: string[] = [];
+    ctx.ui.confirm = async (title: string, message?: string) => {
+      asked.push(`${title} :: ${message ?? ""}`);
+      return false;
+    };
+
+    const result = (await toolCallHandler(pi, "guard")(
+      { toolName: "bash", input: { command: "git push --force origin main" } },
+      ctx,
+    )) as BlockedCall | undefined;
+
+    assert.equal(asked.length, 1, "the user must be asked exactly once");
+    assert.match(asked[0] ?? "", /rewrites published history/);
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /declined/);
+  });
+
+  it("runs a confirm-tier command when there is no UI to ask through, but never a blocked one", async () => {
+    // Deliberate, and the one place the doctrine is relaxed: those rules mean
+    // "worth a look", and refusing every sudo in a session that cannot ask is how
+    // a guardrail gets uninstalled.
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const ctx = { ...fakeContext(home), hasUI: false };
+    const handler = toolCallHandler(pi, "guard");
+
+    assert.equal(await handler({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } }, ctx), undefined);
+    const blocked = (await handler({ toolName: "bash", input: { command: "rm -rf /" } }, ctx)) as BlockedCall | undefined;
+    assert.equal(blocked?.block, true);
+  });
+
+  it("ignores everything that is not a bash command", async () => {
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const handler = toolCallHandler(pi, "guard");
+
+    assert.equal(await handler({ toolName: "read", input: { path: "x" } }, fakeContext(home)), undefined);
+    assert.equal(await handler({ toolName: "bash", input: {} }, fakeContext(home)), undefined);
+    assert.equal(await handler({ toolName: "bash", input: { command: "   " } }, fakeContext(home)), undefined);
+  });
+
+  it("can be turned off, because it is the user's machine", async () => {
+    const configPath = path.join(home, ".pi", "jev-config.json");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ hook: { bash: false } }), "utf-8");
+    _resetConfigCache();
+
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    assert.equal(
+      await toolCallHandler(pi, "guard")({ toolName: "bash", input: { command: "rm -rf /" } }, fakeContext(home)),
+      undefined,
+    );
   });
 });
 

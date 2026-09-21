@@ -127,6 +127,25 @@ describe("generateCandidates", () => {
     assert.match(candidates[0]?.preview ?? "", /export function login/);
   });
 
+  it("prefers what a file declares over the imports it starts with", () => {
+    // Four import lines make every source file look identical to the provider,
+    // which leaves the filter guessing — and a wrong drop is the silent failure.
+    const { candidates } = generateCandidates({ cwd: sample, globs: ["auth.test.ts"] });
+    const preview = candidates[0]?.preview ?? "";
+    assert.match(preview, /export function testLoginRejects/);
+    assert.doesNotMatch(preview, /^import /m);
+  });
+
+  it("shows the line that matched and the line after it, not the file's opening lines", () => {
+    const { candidates } = generateCandidates({ cwd: sample, globs: ["*.ts"], pattern: "validateCredentials" });
+    assert.equal(candidates.length, 1);
+    const preview = candidates[0]?.preview ?? "";
+    // The match is the reason the file is in the list, so it belongs in the excerpt…
+    assert.match(preview, /export function login/);
+    // …and so does the line after it, so the hit is not read out of context.
+    assert.match(preview, /return validateCredentials/);
+  });
+
   it("filters to files whose content matches the pattern", () => {
     const { candidates } = generateCandidates({ cwd: sample, globs: ["*.ts"], pattern: "createInvoice" });
     assert.equal(candidates.length, 1);

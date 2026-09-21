@@ -189,24 +189,66 @@ export function clearLedger(): void {
  * dropped. In-memory only: this is a within-session signal, and a stale entry
  * from last week would misattribute an unrelated read.
  */
-const recentDrops = new Map<string, { dropped: Set<string>; tool: string; at: number }>();
+const recentDrops = new Map<string, { dropped: Set<string>; tool: string; at: number; root?: string }>();
 
 const DROP_TTL_MS = 30 * 60 * 1000;
 
-export function rememberDrops(decisionId: string, dropped: string[], tool: string): void {
+/**
+ * Remember what a filter withheld, and the directory its keys are relative to.
+ *
+ * The root matters: a triage key is relative to the search root, while the path
+ * a later `read` carries is relative to the working directory or absolute. Only
+ * resolving both against something gives a comparison that means anything.
+ */
+export function rememberDrops(decisionId: string, dropped: string[], tool: string, root?: string): void {
   if (dropped.length === 0) return;
-  recentDrops.set(decisionId, { dropped: new Set(dropped), tool, at: Date.now() });
+  recentDrops.set(decisionId, { dropped: new Set(dropped), tool, at: Date.now(), ...(root ? { root } : {}) });
   for (const [id, entry] of recentDrops) {
     if (Date.now() - entry.at > DROP_TTL_MS) recentDrops.delete(id);
   }
 }
 
 /**
- * Did a recently-dropped item just get touched? Matching is path-based and
- * deliberately loose: an absolute path, a relative path or a bare basename all
- * count, because the tool that touches the file may use any of them.
+ * Do these two references name the same file?
+ *
+ * Loose in one direction, strict in the other. Loose because the tool that
+ * touches a file may name it absolutely, relative to the project, or relative
+ * to a subdirectory, and all three have to count. Strict because a bare file
+ * name is not an identity: `index.ts`, `types.ts` and `README.md` appear in most
+ * projects several times over, so matching on the name alone reports a false
+ * miss every time any of them is read anywhere.
+ *
+ * That matters more than it looks. The shadow-miss count is the number that
+ * decides whether keeping a filter is justifiable, so false hits make the one
+ * measurement the feature exists for meaningless.
+ *
+ * A single segment therefore only matches a single segment exactly; a shorter
+ * path matches a longer one only when it brings at least two segments with it.
+ * Where a root is known, `findShadowMiss` resolves both sides instead and never
+ * reaches this comparison.
  */
-export function findShadowMiss(candidate: string): { decisionId: string; item: string } | null {
+function sameSuffix(a: string, b: string): boolean {
+  const left = a.split("/").filter(Boolean);
+  const right = b.split("/").filter(Boolean);
+  if (left.length === 0 || right.length === 0) return false;
+
+  const [short, long] = left.length <= right.length ? [left, right] : [right, left];
+  if (short.length < 2) return short.length === long.length && short[0] === long[0];
+
+  for (let offset = 1; offset <= short.length; offset += 1) {
+    if (short[short.length - offset] !== long[long.length - offset]) return false;
+  }
+  return true;
+}
+
+/**
+ * Did a recently-dropped item just get touched?
+ *
+ * `cwd` is the working directory the touching tool ran in. With it, and with the
+ * root the drops were relative to, both sides are resolved and compared as
+ * paths; without it the comparison falls back to segment suffixes.
+ */
+export function findShadowMiss(candidate: string, cwd?: string): { decisionId: string; item: string } | null {
   const normalised = candidate.replace(/\\/g, "/");
   for (const [decisionId, entry] of recentDrops) {
     if (Date.now() - entry.at > DROP_TTL_MS) {
@@ -215,12 +257,13 @@ export function findShadowMiss(candidate: string): { decisionId: string; item: s
     }
     for (const item of entry.dropped) {
       const itemNorm = item.replace(/\\/g, "/");
-      if (
-        normalised === itemNorm ||
-        normalised.endsWith(`/${itemNorm}`) ||
-        itemNorm.endsWith(`/${normalised}`) ||
-        path.basename(normalised) === path.basename(itemNorm)
-      ) {
+      if (entry.root && cwd) {
+        if (path.resolve(entry.root, itemNorm) === path.resolve(cwd, normalised)) {
+          return { decisionId, item };
+        }
+        continue;
+      }
+      if (sameSuffix(normalised, itemNorm)) {
         return { decisionId, item };
       }
     }

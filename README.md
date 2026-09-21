@@ -37,6 +37,16 @@ The saving is not linear. Each turn re-sends the whole context, so exploratory
 reading costs tokens × turns. That is where the money goes, and that is where a
 100 ms filter that removes an entire exploration loop pays for itself.
 
+**What that is worth depends on what your main model costs**, and it is worth
+saying so rather than implying a saving that only exists at frontier prices.
+Against a model at dollars per million tokens, this is a large win. Against a
+budget model at a few cents, the tokens pi-jev removes are worth fractions of a
+cent per call — the ledger will show you plainly: a triage call over nineteen
+files costs about $0.00015, which is not a reason to use anything. What is left
+at that price is a cleaner context, one fewer exploration loop, and the guard in
+point 1 below, which costs nothing, needs no provider, and is the part that works
+whether or not the money argument applies to you.
+
 ---
 
 ## Install
@@ -104,6 +114,16 @@ part worth a model call.
 Two consequences worth stating plainly:
 
 - **The gate works with no provider, no key and no network.**
+- **The rules are enforced, not merely offered.** `jev_gate` fires only when the
+  model chooses to call it, and a model that has already decided to run a command
+  is not the party you want asking on its own behalf. So the same rules also run
+  as a `tool_call` hook on every `bash` command (`hook.bash`, on by default): a
+  `block` verdict stops the command before it runs, a `confirm` verdict is put to
+  the user. A guardrail the model can skip is not a guardrail.
+  The one deliberate relaxation: a `confirm` verdict runs when there is no UI to
+  ask through, because those rules mean "worth a look" rather than "unambiguous
+  danger", and silently refusing every `sudo` in a scripted session is how a
+  guardrail gets uninstalled. The `block` tier is refused with or without a UI.
 - **A model is not a security boundary.** It is probabilistic, and a
   probability of 0.95 is not a guarantee. Calling this "deterministic safety"
   would be dishonest; what is deterministic is the rule layer, and the model
@@ -133,7 +153,9 @@ those five, and reaches a confident wrong conclusion with no error anywhere.
 So `jev_triage` can run in shadow mode. It filters and logs, but returns every
 candidate marked `keep` or `drop`. pi-jev then watches whether the agent reads
 something the filter had rejected, and records it as a **candidate false
-negative**.
+negative** — resolving both paths against the directory they are relative to
+first, so two files that merely share a name (`index.ts`, `types.ts`) are not
+counted as each other.
 
 ```
 /jev-shadow triage on
@@ -175,6 +197,7 @@ way to know is to write down what happened.
 | **A search engine** | It needs the questions defined in advance. Open-ended "find out why X happens" is not a decision. |
 | **A guardrail on its own** | The rules catch the unambiguous; the model refines the rest. Neither is a sandbox and neither is a permission system. |
 | **Free** | Jev is roughly $0.042 per million input tokens with free output. Local models cost nothing but take seconds — fine for triage, too slow for the gate. |
+| **A way to save money on a cheap model** | At a few cents per million tokens the token saving is a rounding error, and the ledger will say so. What remains is context precision, latency, and the guard — which costs nothing and works with no provider at all. |
 | **Verified against a live account** | See below. |
 
 ### The API contract, as verified
@@ -224,6 +247,7 @@ confidence being invented. Nothing downstream depends on a guess.
     "destructive": "block",
     "needs_human": "confirm"
   },
+  "hook": { "bash": true }, // apply the deterministic rules to every bash call, not only to jev_gate
   "shadow": { "triage": false, "verify": false, "gate": false },
   "ledger": { "maxBytes": 8388608, "keepEntries": 5000 }
 }
@@ -242,7 +266,7 @@ guesses. The ledger exists to replace them with measured ones.
 
 ```bash
 npm install
-npm test        # 254 tests, no network required
+npm test        # 274 tests, no network required
 npm run typecheck
 ```
 
