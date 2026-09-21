@@ -11,9 +11,20 @@
  *
  * So the parser is written to accept every plausible spelling and to say so
  * when it had to guess, instead of silently coercing a wrong number into a
- * confident-looking probability. When you make the first real call, run
- * `/jev` and check the reported token counts — if they read 0, one field name
- * needs to be added to `pickNumber` below. Nothing else depends on it.
+ * confident-looking probability.
+ *
+ * Both shapes below are now checked against the live endpoint and the published
+ * documentation (`docs.typesafe.ai/primitives`), which is worth stating because
+ * the two question types that carry criteria do *not* carry them the same way:
+ *
+ *   choice  criteria = map    option → meaning
+ *   score   criteria = list   level descriptions, in order, and the order is
+ *                             the numbering: level i is the i-th entry
+ *   noul    criteria = map    optionally what yes and no mean
+ *
+ * Sending a score's levels as a map is rejected outright — HTTP 422, before any
+ * tokens are spent — so `serialiseQuestion` converts, and the level a score
+ * answer comes back as is recovered from the level numbering here.
  */
 
 import type { AnswerValue, QuestionSpec, QuestionType } from "./types.ts";
@@ -33,6 +44,78 @@ export function isQuestionType(value: unknown): value is QuestionType {
  * `score` because an option list without meanings is the single most common
  * way to get a useless answer out of a decision model.
  */
+/** The endpoint answers HTTP 400 past this many score levels. */
+export const MAX_SCORE_LEVELS = 10;
+
+/**
+ * Bring criteria into the one shape the rest of the package uses: a map keyed
+ * by the option or level the caller named.
+ *
+ * The endpoint takes a different shape per question type, and getting that
+ * wrong is not cosmetic — a score whose levels are sent as a map is refused
+ * with HTTP 422 before a single token is spent on a decision. So the conversion
+ * happens here, once, and no caller has to know which type wants what:
+ *
+ *  - `choice` needs a map. A list is rejected, because an unordered answer set
+ *    with no labels is the most common way to get a useless answer.
+ *  - `score` needs an ordered list. A list is therefore accepted and keyed
+ *    "0".."n-1", because the position *is* the level number; a map is kept as
+ *    written, and its key order is the level order.
+ *  - `noul` optionally takes a map describing what yes and no mean. That is a
+ *    real field, not decoration: it moves the reported probability, so it is
+ *    sent rather than dropped.
+ */
+function normaliseCriteria(id: string, type: QuestionType, input: unknown): Record<string, string> | undefined {
+  if (input === undefined) {
+    if (type === "choice" || type === "score") {
+      throw new QuestionError(
+        `Question "${id}" is a ${type} and needs criteria: the options or levels with their meaning.`,
+      );
+    }
+    return undefined;
+  }
+
+  let criteria: Record<string, string>;
+  if (Array.isArray(input)) {
+    if (type !== "score") {
+      throw new QuestionError(
+        `Question "${id}" is a ${type} and needs criteria as an object of option → meaning; ` +
+          "only a score takes an ordered list of levels.",
+      );
+    }
+    criteria = {};
+    for (const [position, level] of input.entries()) {
+      if (typeof level !== "string" || level.trim().length === 0) {
+        throw new QuestionError(`Question "${id}" has an empty level description at position ${position}.`);
+      }
+      criteria[String(position)] = level;
+    }
+  } else if (typeof input === "object" && input !== null) {
+    criteria = { ...(input as Record<string, string>) };
+    for (const [option, meaning] of Object.entries(criteria)) {
+      if (typeof meaning !== "string" || meaning.trim().length === 0) {
+        throw new QuestionError(`Question "${id}" has an empty meaning for option "${option}".`);
+      }
+    }
+  } else {
+    throw new QuestionError(
+      `Question "${id}" has criteria that are neither an object of option → meaning nor a list of levels.`,
+    );
+  }
+
+  const count = Object.keys(criteria).length;
+  if ((type === "choice" || type === "score") && count < 2) {
+    throw new QuestionError(`Question "${id}" is a ${type} and needs at least two options.`);
+  }
+  if (type === "score" && count > MAX_SCORE_LEVELS) {
+    throw new QuestionError(
+      `Question "${id}" is a score with ${count} levels, and the endpoint accepts at most ${MAX_SCORE_LEVELS}. ` +
+        "Fold together the levels you cannot describe distinctly, or split the judgement into two questions.",
+    );
+  }
+  return criteria;
+}
+
 export function normaliseQuestion(input: Partial<QuestionSpec> & { id?: string }, index: number): QuestionSpec {
   const id = (input.id ?? `q${index + 1}`).trim();
   if (id.length === 0) throw new QuestionError("A question id must not be empty.");
@@ -44,24 +127,7 @@ export function normaliseQuestion(input: Partial<QuestionSpec> & { id?: string }
     throw new QuestionError(`Question "${id}" needs instructions; the model never sees the id.`);
   }
 
-  const criteria = input.criteria;
-  if (criteria !== undefined) {
-    if (typeof criteria !== "object" || criteria === null || Array.isArray(criteria)) {
-      throw new QuestionError(`Question "${id}" has criteria that are not an object of option → meaning.`);
-    }
-    for (const [option, meaning] of Object.entries(criteria)) {
-      if (typeof meaning !== "string" || meaning.trim().length === 0) {
-        throw new QuestionError(`Question "${id}" has an empty meaning for option "${option}".`);
-      }
-    }
-    if ((input.type === "choice" || input.type === "score") && Object.keys(criteria).length < 2) {
-      throw new QuestionError(`Question "${id}" is a ${input.type} and needs at least two options.`);
-    }
-  } else if (input.type === "choice" || input.type === "score") {
-    throw new QuestionError(
-      `Question "${id}" is a ${input.type} and needs criteria: the options or levels with their meaning.`,
-    );
-  }
+  const criteria = normaliseCriteria(id, input.type, input.criteria);
 
   const spec: QuestionSpec = { id, type: input.type, instructions };
   if (criteria) spec.criteria = criteria;
@@ -84,6 +150,20 @@ export function normaliseQuestions(inputs: Array<Partial<QuestionSpec>>): Questi
 /* ---------------------------------------------------------------- payloads */
 
 /**
+ * Criteria in the shape the endpoint wants for this question type.
+ *
+ * A score's levels travel as an ordered array of descriptions, from the low end
+ * of the scale to the high end, and the position in that array is the level
+ * number. The keys of the map are ours: the model never sees a level's number,
+ * which is why they are dropped here rather than folded into the description.
+ */
+function wireCriteria(spec: QuestionSpec): unknown {
+  if (!spec.criteria) return undefined;
+  if (spec.type !== "score") return spec.criteria;
+  return Object.keys(spec.criteria).map((level) => spec.criteria?.[level] ?? "");
+}
+
+/**
  * The wire shape for one question. `id` is intentionally absent — the key of
  * the questions map carries it and the model gains nothing from a slug.
  */
@@ -92,7 +172,8 @@ export function serialiseQuestion(spec: QuestionSpec): Record<string, unknown> {
     type: spec.type,
     instructions: spec.instructions,
   };
-  if (spec.criteria) out.criteria = spec.criteria;
+  const criteria = wireCriteria(spec);
+  if (criteria) out.criteria = criteria;
   return out;
 }
 
@@ -146,7 +227,34 @@ export interface ParsedAnswers {
  * not be done. Never invents a probability: a missing one becomes `degraded`
  * with p=0.5 and a note, so the ledger shows it rather than hiding it.
  */
-function parseAnswer(id: string, expected: QuestionType, raw: unknown, notes: string[]): AnswerValue | null {
+function argmaxKey(record: Record<string, number>): string | null {
+  let best: string | null = null;
+  for (const [key, value] of Object.entries(record)) {
+    if (best === null || value > (record[best] ?? 0)) best = key;
+  }
+  return best;
+}
+
+/** "3" → 3, so a level that is a number stays one for arithmetic downstream. */
+function numericOrText(value: string): string | number {
+  const num = Number(value);
+  return value.trim() !== "" && Number.isFinite(num) ? num : value;
+}
+
+/** Relabel a level distribution with the descriptions the caller declared. */
+function relabelLevels(probabilities: Record<string, number>, levels: readonly string[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(probabilities)) {
+    const index = Number(key);
+    const label = Number.isInteger(index) ? levels[index] : undefined;
+    out[label ?? key] = value;
+  }
+  return out;
+}
+
+function parseAnswer(spec: QuestionSpec, raw: unknown, notes: string[]): AnswerValue | null {
+  const id = spec.id;
+  const expected = spec.type;
   const record = asRecord(raw);
   if (record === null) {
     // Some endpoints may return the bare value rather than an envelope.
@@ -203,20 +311,48 @@ function parseAnswer(id: string, expected: QuestionType, raw: unknown, notes: st
   }
 
   // score
-  const score = pickNumber(record, ["score", "value", "level", "rating"]);
-  if (score === null) {
+  //
+  // The endpoint answers with a *position on the level number line*, not with a
+  // level: `score` is each level number multiplied by its probability, so it can
+  // land between two levels (the documented example is 0 x 0.0 + 1 x 0.57 +
+  // 2 x 0.43 = 1.43 on a three-level scale). Code that needs one outcome rounds
+  // it, which is what the API documentation recommends and what `value` here
+  // carries, as one of the caller's own level names.
+  //
+  // `probabilities` is the distribution over level numbers, and where it is
+  // present the peak is a better reading than the rounded mean: a score of 1.0
+  // can mean all the weight is on level 1, or half of it on each of levels 0
+  // and 2, and those are not the same claim. Reading the peak also gives the
+  // probability that belongs to the level we report, which is the quantity
+  // calibration is computed over.
+  const position = pickNumber(record, ["score", "value", "level", "rating"]);
+  if (position === null) {
     notes.push(`Answer "${id}" is a score but no numeric value came back.`);
     return null;
   }
-  let p = pickNumber(record, ["probability", "prob", "p"]);
-  if (p === null && confidence !== null) p = confidence;
-  const degraded = p === null;
-  if (degraded) notes.push(`Answer "${id}" came back without a confidence for the score.`);
-  const answer: AnswerValue = { type: "score", p: clamp01(p ?? 0.5), value: score };
-  if (probabilities) answer.probabilities = probabilities;
-  if (confidence !== null) answer.confidence = clamp01(confidence);
-  if (degraded) answer.degraded = true;
-  return answer;
+
+  const levels = Object.keys(spec.criteria ?? {});
+  const peak = probabilities ? argmaxKey(probabilities) : null;
+  const peakIndex = peak === null ? Number.NaN : Number(peak);
+  // Fall back to the rounded position when there is no distribution to read, or
+  // when a provider keyed its levels by something that is not a level number.
+  const levelIndex = Number.isInteger(peakIndex) ? peakIndex : Math.round(position);
+
+  const label = levels[levelIndex];
+  const scored: AnswerValue = {
+    type: "score",
+    p: clamp01(peak !== null ? probabilities?.[peak] ?? 0.5 : confidence ?? 0.5),
+    value: label === undefined ? levelIndex : numericOrText(label),
+  };
+  if (probabilities) scored.probabilities = relabelLevels(probabilities, levels);
+  if (confidence !== null) scored.confidence = clamp01(confidence);
+
+  const scoreProbability = peak !== null ? probabilities?.[peak] ?? null : confidence;
+  if (scoreProbability === null) {
+    notes.push(`Answer "${id}" came back without a probability for the chosen level.`);
+    scored.degraded = true;
+  }
+  return scored;
 }
 
 export interface ParseResult {
@@ -258,7 +394,7 @@ export function parseResponse(payload: unknown, specs: readonly QuestionSpec[]):
 
   for (const spec of specs) {
     // Providers may key by question id or by position; the id is the contract.
-    const parsed = parseAnswer(spec.id, spec.type, container[spec.id], notes);
+    const parsed = parseAnswer(spec, container[spec.id], notes);
     if (parsed === null) {
       notes.push(`Question "${spec.id}" got no usable answer.`);
       continue;
@@ -342,8 +478,15 @@ export function buildFallbackPrompt(state: unknown, specs: readonly QuestionSpec
     lines.push(`### ${spec.id} (type: ${spec.type})`);
     lines.push(spec.instructions);
     if (spec.criteria) {
-      lines.push("Options:");
-      for (const [option, meaning] of Object.entries(spec.criteria)) lines.push(`  - ${option}: ${meaning}`);
+      lines.push(spec.type === "score" ? "Levels, in order from low to high:" : "Options:");
+      let position = 0;
+      for (const [option, meaning] of Object.entries(spec.criteria)) {
+        // A score's levels are numbered from 0 by their position, the same way
+        // the endpoint numbers them, so the local model answers in the same
+        // numbering the rest of this file reads back.
+        lines.push(spec.type === "score" ? `  - level ${position}: ${meaning}` : `  - ${option}: ${meaning}`);
+        position += 1;
+      }
     }
   }
   lines.push("");
@@ -351,7 +494,7 @@ export function buildFallbackPrompt(state: unknown, specs: readonly QuestionSpec
   lines.push('Reply with {"answers": { ... }} where each entry matches its type:');
   lines.push('  noul   -> {"noul": <probability 0..1>}');
   lines.push('  choice -> {"choice": "<option>", "probabilities": {"<option>": <probability 0..1>, ...}}');
-  lines.push('  score  -> {"score": <number>, "confidence": <probability 0..1>}');
+  lines.push('  score  -> {"score": <level number, 0 for the first level>, "confidence": <probability 0..1>}');
   lines.push("Probabilities must be honest estimates, not 1.0 by default.");
 
   if (!specs.some((spec) => spec.type !== "noul")) {

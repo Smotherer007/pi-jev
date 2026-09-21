@@ -7,7 +7,7 @@
  */
 
 import { getConfig, providerChain, type ProviderEntry } from "../config.ts";
-import { costOf, hashState, newId, recordDecision } from "../ledger.ts";
+import { costOf, estimateTokens, hashState, newId, recordDecision } from "../ledger.ts";
 import type {
   AnswerValue,
   DecisionProvider,
@@ -107,7 +107,7 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
       // cost column stays meaningful instead of silently reading zero.
       const usage: Usage =
         response.usage.inputTokens === 0 && stateText.length > 0
-          ? { inputTokens: Math.ceil(stateText.length / 4), outputTokens: response.usage.outputTokens }
+          ? { inputTokens: estimateTokens(stateText), outputTokens: response.usage.outputTokens }
           : response.usage;
 
       const decisionId = newId("dec");

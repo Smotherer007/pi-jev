@@ -27,6 +27,13 @@ const choice: QuestionSpec = {
   criteria: { billing: "Charges and refunds", tech: "Bugs and outages" },
 };
 
+const score: QuestionSpec = {
+  id: "severity",
+  type: "score",
+  instructions: "How severe is the bug?",
+  criteria: { "0": "cosmetic", "1": "workaround exists", "2": "no workaround" },
+};
+
 describe("normaliseQuestion", () => {
   it("accepts a well-formed noul", () => {
     assert.equal(normaliseQuestion(noul, 0).id, "is_sponsor");
@@ -66,11 +73,42 @@ describe("normaliseQuestion", () => {
     );
   });
 
-  it("rejects criteria that are an array", () => {
+  it("rejects a list of criteria for a choice, which takes a map of options", () => {
     assert.throws(
       () => normaliseQuestion({ id: "c", type: "choice", instructions: "which?", criteria: ["a", "b"] as never }, 0),
-      /not an object/,
+      /only a score takes an ordered list/,
     );
+  });
+
+  it("numbers the levels of a score given as a list, because the position is the level", () => {
+    const spec = normaliseQuestion(
+      { id: "s", type: "score", instructions: "how bad?", criteria: ["low", "middling", "high"] as never },
+      0,
+    );
+    assert.deepEqual(spec.criteria, { "0": "low", "1": "middling", "2": "high" });
+  });
+
+  it("rejects a score with more levels than the endpoint accepts", () => {
+    const eleven = Array.from({ length: 11 }, (_, index) => `level ${index}`);
+    assert.throws(
+      () => normaliseQuestion({ id: "s", type: "score", instructions: "how bad?", criteria: eleven as never }, 0),
+      /at most 10/,
+    );
+  });
+
+  it("rejects an empty level description inside a score's list", () => {
+    assert.throws(
+      () => normaliseQuestion({ id: "s", type: "score", instructions: "how bad?", criteria: ["low", " "] as never }, 0),
+      /empty level description at position 1/,
+    );
+  });
+
+  it("keeps a noul's criteria as a map, which the endpoint does use", () => {
+    const spec = normaliseQuestion(
+      { id: "n", type: "noul", instructions: "is it urgent?", criteria: { true: "it is", false: "it is not" } },
+      0,
+    );
+    assert.deepEqual(spec.criteria, { true: "it is", false: "it is not" });
   });
 });
 
@@ -96,8 +134,37 @@ describe("serialiseQuestion", () => {
     assert.equal(wire.instructions, noul.instructions);
   });
 
-  it("carries criteria through", () => {
+  it("keeps a choice's criteria as the map that names its options", () => {
     assert.deepEqual(serialiseQuestion(choice).criteria, choice.criteria);
+  });
+
+  it("sends a score's levels as an ordered list, which is the only shape the endpoint takes", () => {
+    // A map here is HTTP 422 before a single token is spent: the endpoint wants
+    // the levels in order, and the position in that array is the level number.
+    // The keys of our map are ours — the model never sees a level's number.
+    const spec = normaliseQuestion(
+      {
+        id: "blast",
+        type: "score",
+        instructions: "How far does the damage reach?",
+        criteria: { "1": "this machine", "2": "several files", "3": "a shared system", "4": "production" },
+      },
+      0,
+    );
+    assert.deepEqual(serialiseQuestion(spec).criteria, [
+      "this machine",
+      "several files",
+      "a shared system",
+      "production",
+    ]);
+  });
+
+  it("keeps a noul's criteria as a map of what yes and no mean", () => {
+    const spec = normaliseQuestion(
+      { id: "safe", type: "noul", instructions: "is it safe?", criteria: { true: "safe", false: "confirm first" } },
+      0,
+    );
+    assert.deepEqual(serialiseQuestion(spec).criteria, { true: "safe", false: "confirm first" });
   });
 
   it("keys the questions map by id", () => {
@@ -175,11 +242,90 @@ describe("parseResponse", () => {
     assert.equal(parsed.answers.is_sponsor?.p, 1);
   });
 
-  it("reads a score with its level", () => {
-    const spec: QuestionSpec = { id: "sev", type: "score", instructions: "How bad?", criteria: { "1": "low", "2": "high" } };
-    const parsed = parseResponse({ answers: { sev: { type: "score", score: 2, confidence: 0.55 } } }, [spec]);
-    assert.equal(parsed.answers.sev?.value, 2);
-    assert.equal(parsed.answers.sev?.p, 0.55);
+  it("reads a score as one of the caller's own levels, from the peak of the distribution", () => {
+    // 0 x 0.0 + 1 x 0.57 + 2 x 0.43 = 1.43: the position sits between levels 1
+    // and 2, so the distribution decides which level is reported. Captured from
+    // the live endpoint, arithmetic and all.
+    const parsed = parseResponse(
+      {
+        answers: {
+          severity: {
+            type: "score",
+            score: 1.43,
+            confidence: 0.35,
+            legend: { 0: "cosmetic", 1: "workaround exists", 2: "no workaround" },
+            probabilities: { 0: 0, 1: 0.57, 2: 0.43 },
+          },
+        },
+      },
+      [score],
+    );
+    assert.equal(parsed.answers.severity?.value, 1);
+    assert.equal(parsed.answers.severity?.p, 0.57);
+    assert.equal(parsed.answers.severity?.confidence, 0.35);
+    // The criteria keys here are the level numbers themselves, so the
+    // distribution comes back under the numbers it arrived with.
+    assert.deepEqual(parsed.answers.severity?.probabilities, { "0": 0, "1": 0.57, "2": 0.43 });
+    assert.equal(parsed.answers.severity?.degraded, undefined);
+  });
+
+  it("names the level it reports when the caller named its levels", () => {
+    const named: QuestionSpec = {
+      id: "severity",
+      type: "score",
+      instructions: "How severe is the bug?",
+      criteria: { cosmetic: "looks wrong", "workaround exists": "broken, but there is a way round it", "no workaround": "nothing works" },
+    };
+    const parsed = parseResponse(
+      { answers: { severity: { type: "score", score: 1.43, confidence: 0.35, probabilities: { 0: 0, 1: 0.57, 2: 0.43 } } } },
+      [named],
+    );
+    // Level 1, in the caller's own vocabulary, with the probability of *that*
+    // level rather than the confidence of the whole position.
+    assert.equal(parsed.answers.severity?.value, "workaround exists");
+    assert.equal(parsed.answers.severity?.p, 0.57);
+    assert.deepEqual(parsed.answers.severity?.probabilities, {
+      cosmetic: 0,
+      "workaround exists": 0.57,
+      "no workaround": 0.43,
+    });
+  });
+
+  it("maps a score back to a named level, which is what jev_gate's blast radius is", () => {
+    const blast: QuestionSpec = {
+      id: "blast",
+      type: "score",
+      instructions: "How far does the damage reach?",
+      criteria: { "1": "this machine", "2": "several files", "3": "a shared system", "4": "production" },
+    };
+    const parsed = parseResponse(
+      {
+        answers: {
+          blast: {
+            type: "score",
+            score: 2.99,
+            confidence: 0.99,
+            probabilities: { 0: 0, 1: 0, 2: 0, 3: 1 },
+          },
+        },
+      },
+      [blast],
+    );
+    assert.equal(parsed.answers.blast?.value, 4);
+    assert.equal(parsed.answers.blast?.p, 1);
+  });
+
+  it("rounds the position when no distribution comes back, because a level is what was asked for", () => {
+    const parsed = parseResponse({ answers: { severity: { type: "score", score: 1.6, confidence: 0.55 } } }, [score]);
+    assert.equal(parsed.answers.severity?.value, 2);
+    assert.equal(parsed.answers.severity?.p, 0.55);
+  });
+
+  it("marks a score with neither a distribution nor a confidence as degraded", () => {
+    const parsed = parseResponse({ answers: { severity: { score: 1.4 } } }, [score]);
+    assert.equal(parsed.answers.severity?.value, 1);
+    assert.equal(parsed.answers.severity?.p, 0.5);
+    assert.equal(parsed.answers.severity?.degraded, true);
   });
 
   it("clamps probabilities into 0..1 instead of propagating nonsense", () => {
@@ -284,5 +430,12 @@ describe("buildFallbackPrompt", () => {
 
   it("serialises a non-string state", () => {
     assert.match(buildFallbackPrompt({ key: "value" }, [noul]), /"key": "value"/);
+  });
+
+  it("numbers a score's levels from 0, the way the endpoint numbers them", () => {
+    const prompt = buildFallbackPrompt("s", [score]);
+    assert.match(prompt, /level 0: cosmetic/);
+    assert.match(prompt, /level 2: no workaround/);
+    assert.match(prompt, /0 for the first level/);
   });
 });

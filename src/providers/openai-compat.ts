@@ -17,7 +17,7 @@
  */
 
 import type { ProviderEntry } from "../config.ts";
-import type { DecisionProvider, DecisionRequest, DecisionResponse, ProviderHealth } from "../types.ts";
+import type { DecisionProvider, DecisionRequest, DecisionResponse, ProviderHealth, QuestionSpec } from "../types.ts";
 import { buildFallbackPrompt, extractJsonObject, parseResponse } from "../questions.ts";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -144,6 +144,20 @@ export class OpenAICompatProvider implements DecisionProvider {
         : { answers: parsedJson };
 
     const parsed = parseResponse(wrapped, request.questions);
+
+    // The check a System One model makes unnecessary, done by hand here because
+    // this provider really can violate the schema. A local model that picks an
+    // option we never offered has produced an answer that looks exactly as
+    // convincing as a correct one, so it is marked degraded rather than passed
+    // on as a probability worth calibrating against.
+    const violations = findSchemaViolations(parsed.answers, request.questions);
+    for (const violation of violations) {
+      const answer = parsed.answers[violation.questionId];
+      if (answer) answer.degraded = true;
+      parsed.notes.push(`question "${violation.questionId}": ${violation.detail}`);
+    }
+    if (violations.length > 0) parsed.degraded = true;
+
     const usage = payload.usage ?? {};
     const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
     const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
@@ -166,22 +180,48 @@ export class OpenAICompatProvider implements DecisionProvider {
   }
 }
 
+export interface SchemaViolation {
+  questionId: string;
+  detail: string;
+}
+
 /**
- * Validate a fallback answer against the declared option list.
+ * Validate a fallback answer against the options the caller declared.
  *
  * This is the check Jev makes unnecessary, so it is worth doing explicitly
- * here: a local model that picks an option we never offered has produced a
- * schema violation, and the caller must know rather than receive a
- * plausible-looking wrong answer.
+ * here: its output domain is fixed before it runs, so an option that was never
+ * offered cannot come back. A plain chat model has no such constraint, and the
+ * answer it invents reads exactly like a correct one — which is why the caller
+ * must be told, rather than handed a plausible-looking wrong answer.
+ *
+ * The value of a score is the level it landed on, and a no-op for a noul: every
+ * boolean is inside a yes/no domain.
  */
 export function findSchemaViolations(
   answers: Record<string, { value: boolean | string | number }>,
-): string[] {
-  const violations: string[] = [];
-  for (const [id, answer] of Object.entries(answers)) {
+  specs: readonly QuestionSpec[],
+): SchemaViolation[] {
+  const violations: SchemaViolation[] = [];
+
+  for (const spec of specs) {
+    const answer = answers[spec.id];
+    // A question with no answer at all is already reported by the parser.
+    if (!answer) continue;
     if (answer.value === null || answer.value === undefined) {
-      violations.push(`Question "${id}" produced no value.`);
+      violations.push({ questionId: spec.id, detail: "it produced no value" });
+      continue;
+    }
+    if (spec.type === "noul") continue;
+
+    const allowed = spec.criteria ? Object.keys(spec.criteria) : [];
+    if (allowed.length === 0) continue;
+    if (!allowed.includes(String(answer.value))) {
+      violations.push({
+        questionId: spec.id,
+        detail: `it answered "${String(answer.value)}", which is not one of ${allowed.join(", ")}`,
+      });
     }
   }
+
   return violations;
 }

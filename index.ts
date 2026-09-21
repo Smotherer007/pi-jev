@@ -50,9 +50,12 @@ import { JevGateTool } from "./src/tools/jev-gate.ts";
 import { JevLabelTool } from "./src/tools/jev-label.ts";
 
 /**
- * The four tools worth mentioning in the system prompt. `jev_setup` and
- * `jev_status` are administrative and `jev_label` is retrospective, so they
- * carry their own snippets without occupying the Guidelines section.
+ * Every tool the extension registers.
+ *
+ * The four the agent is meant to reach for on its own — jev_decide, jev_triage,
+ * jev_verify, jev_gate — carry prompt guidelines that say when to use them.
+ * jev_setup, jev_status and jev_label are administrative or retrospective, so
+ * they carry only a snippet and stay out of the Guidelines section.
  */
 const TOOLS = [JevSetupTool, JevStatusTool, JevDecideTool, JevTriageTool, JevVerifyTool, JevGateTool, JevLabelTool];
 

@@ -183,7 +183,6 @@ export const JevTriageTool = {
 
     const scored: Array<{ item: Candidate; p: number; keep: boolean }> = [];
     const decisions: string[] = [];
-    const chunkDrops: string[] = [];
     const attempts: Array<{ provider: string; error: string }> = [];
     let provider = "";
     let latencyMs = 0;
@@ -239,8 +238,6 @@ export const JevTriageTool = {
         // Keep whatever earlier chunks produced rather than losing the whole
         // triage to one bad batch; report the shortfall instead.
       }
-
-      chunkDrops.push(...chunkDropped);
     }
 
     if (scored.length === 0) {
@@ -255,14 +252,15 @@ export const JevTriageTool = {
     const survivors = ranked.filter((row) => row.keep).slice(0, maxKeep);
     const survivorKeys = new Set(survivors.map((row) => row.item.key));
 
-    // What the returned list looks like. In shadow mode the agent gets every
-    // candidate, because the whole point is to read freely while measuring.
-    const rows: TriageRow[] = shadow
+    // What the returned list looks like. Shadow mode lists every candidate so the
+    // agent can read freely while the filter is measured, and an explicit
+    // showCandidates request does the same outside shadow mode. Printing only the
+    // survivors under a heading that says "all candidates" would misreport what
+    // the filter did.
+    const showAll = shadow || params.showCandidates === true;
+    const rows: TriageRow[] = showAll
       ? ranked.map((row) => ({ key: row.item.key, preview: row.item.preview, p: row.p, keep: row.keep }))
       : survivors.map((row) => ({ key: row.item.key, preview: row.item.preview, p: row.p, keep: true }));
-
-    const visibleDrops =
-      params.showCandidates || shadow ? ranked.filter((row) => !row.keep) : [];
 
     const allDrops = ranked.filter((row) => !row.keep).map((row) => row.item.key);
 
@@ -277,7 +275,7 @@ export const JevTriageTool = {
       considered,
       truncated,
       shadow,
-      showDropped: params.showCandidates === true && !shadow,
+      showDropped: showAll && !shadow,
       decisions,
       degraded,
     });
@@ -294,10 +292,6 @@ export const JevTriageTool = {
       notes.push(
         `${ranked.filter((row) => row.keep).length - survivors.length} further candidates were above the threshold but past maxKeep (${maxKeep}). They are not drops; raise maxKeep to see them.`,
       );
-    }
-    if (visibleDrops.length > 0 && !shadow && params.showCandidates) {
-      notes.push("");
-      notes.push(`Dropped (${visibleDrops.length}), lowest first: ${visibleDrops.slice(-20).reverse().map((row) => `${row.item.key} [${row.p.toFixed(2)}]`).join(", ")}`);
     }
     if (partialFailure) {
       notes.push("");

@@ -28,7 +28,7 @@ import { getConfig } from "../config.ts";
 import { hardGuard, type HardVerdict } from "../guard.ts";
 import { decide } from "../providers/index.ts";
 import { formatGate } from "../format.ts";
-import { RISK_CLASSES, type QuestionSpec } from "../types.ts";
+import { RISK_CLASSES, type GateVerdict, type QuestionSpec } from "../types.ts";
 
 interface GateParams {
   action: string;
@@ -41,6 +41,41 @@ interface GateParams {
 /** Ordered from safest to worst; used when comparing against `allowedRisk`. */
 const ORDER = ["read_only", "reversible", "destructive", "needs_human"] as const;
 
+/**
+ * Is this risk class above the ceiling the caller set?
+ *
+ * `allowedRisk` answers "how much risk may be cleared without asking", so it is
+ * a ceiling on `allow` and nothing else. It never lowers a verdict: a rule that
+ * says `block`, or a risk class the config maps to `block`, stays blocked even
+ * when the caller would have permitted the class. Widening the ceiling lets
+ * more through; it never becomes permission to ignore a refusal.
+ */
+function aboveCeiling(risk: string, allowed: string): boolean {
+  return ORDER.indexOf(risk as (typeof ORDER)[number]) > ORDER.indexOf(allowed as (typeof ORDER)[number]);
+}
+
+/**
+ * Apply the caller's ceiling to a verdict from either layer.
+ *
+ * Both the rule layer and the model layer come through here, because the same
+ * parameter has to mean the same thing in both. It did not: the rule layer
+ * escalated and the model layer only mentioned the ceiling in its rationale, so
+ * `allowedRisk=read_only` could return `ALLOW` with a line underneath saying the
+ * action was above the ceiling the caller had set.
+ */
+function applyAllowedRisk(risk: string, verdict: GateVerdict, allowed: string): GateVerdict {
+  return aboveCeiling(risk, allowed) && verdict === "allow" ? "confirm" : verdict;
+}
+
+/** The consequence of a ceiling, stated once, whether or not it changed anything. */
+function ceilingNote(risk: string, verdict: string, allowed: string): string {
+  if (!aboveCeiling(risk, allowed)) return "";
+  return (
+    `\n\nAbove the allowedRisk you set (${allowed})` +
+    (verdict === "allow" ? "" : `, so this is not cleared: ${verdict}.`)
+  );
+}
+
 const GUIDANCE: Record<string, string> = {
   allow: "\n\nCleared. Proceed.",
   confirm:
@@ -48,15 +83,8 @@ const GUIDANCE: Record<string, string> = {
   block: "\n\nDo not run this. Explain what it would do and let the user decide or run it themselves.",
 };
 
-function ruleReport(hard: HardVerdict, action: string, allowed: string): string {
-  const overAllowed = ORDER.indexOf(hard.risk) > ORDER.indexOf(allowed as (typeof ORDER)[number]);
-  const rationale = [
-    hard.reason,
-    overAllowed ? `above the allowedRisk you set (${allowed})` : "",
-    `blast radius ${hard.blast}/4`,
-  ]
-    .filter(Boolean)
-    .join("; ");
+function ruleReport(hard: HardVerdict, action: string): string {
+  const rationale = [hard.reason, `blast radius ${hard.blast}/4`].filter(Boolean).join("; ");
 
   return formatGate(hard.risk, hard.blast, 1, hard.verdict, rationale, {
     provider: "local rules (no model called)",
@@ -105,19 +133,15 @@ export const JevGateTool = {
     const hard = hardGuard({ action: params.action, ...(params.context ? { context: params.context } : {}) });
 
     if (hard) {
-      // A rule that says "allow" is only allowed to say so when the caller's
-      // own policy permits a read-only action.
-      const verdict = hard.verdict === "allow" && ORDER.indexOf(hard.risk) > ORDER.indexOf(allowed as never)
-        ? "confirm"
-        : hard.verdict;
+      const verdict = applyAllowedRisk(hard.risk, hard.verdict, allowed);
 
       return {
         content: [
           {
             type: "text" as const,
             text:
-              ruleReport(hard, params.action, allowed) +
-              (verdict === hard.verdict ? "" : `\nEscalated to ${verdict} because it exceeds allowedRisk=${allowed}.`) +
+              ruleReport(hard, params.action) +
+              ceilingNote(hard.risk, verdict, allowed) +
               (GUIDANCE[verdict] ?? ""),
           },
         ],
@@ -225,8 +249,9 @@ export const JevGateTool = {
     let verdict = config.gate[risk];
     if (blast !== null && blast >= 3 && verdict === "allow") verdict = "confirm";
     if (blast !== null && blast >= 4 && verdict === "confirm") verdict = "block";
-
-    const overAllowed = ORDER.indexOf(risk) > ORDER.indexOf(allowed as (typeof ORDER)[number]);
+    // Then the caller's own ceiling, which is what makes allowedRisk a policy
+    // rather than a note in the output.
+    verdict = applyAllowedRisk(risk, verdict, allowed);
 
     const rationaleParts: string[] = [];
     if (outcome.answers.risk && outcome.answers.risk.p < 0.6) {
@@ -234,7 +259,7 @@ export const JevGateTool = {
         `the risk class was not a clear call (p=${outcome.answers.risk.p.toFixed(2)}), so the verdict leans cautious`,
       );
     }
-    if (overAllowed) rationaleParts.push(`above the allowedRisk you set (${allowed})`);
+    if (aboveCeiling(risk, allowed)) rationaleParts.push(`above the allowedRisk you set (${allowed})`);
     if (blast !== null && blast >= 3) rationaleParts.push(`blast radius ${blast}/4`);
 
     const text = formatGate(risk, blast, outcome.answers.risk?.p ?? 0.5, verdict, rationaleParts.join("; "), {
