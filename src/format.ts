@@ -225,8 +225,11 @@ export function formatOverview(overview: LedgerOverview): string {
   lines.push("pi-jev ledger");
   lines.push("");
 
+  const usageLines = formatUsage(overview);
+
   if (overview.decisions === 0) {
     lines.push("No decisions recorded yet.");
+    if (usageLines.length > 0) lines.push("", ...usageLines);
     return lines.join("\n");
   }
 
@@ -255,7 +258,30 @@ export function formatOverview(overview: LedgerOverview): string {
     lines.push(`  ${row.tool.padEnd(22)} ${row.n}`);
   }
 
+  if (usageLines.length > 0) lines.push("", ...usageLines);
+
   return lines.join("\n");
+}
+
+/**
+ * Is the decision layer actually being used? Only printed once there is
+ * something to say, so an unused install does not get a table of zeros.
+ */
+function formatUsage(overview: LedgerOverview): string[] {
+  const rows = overview.usage.filter((row) => row.used + row.missed > 0);
+  if (rows.length === 0 && overview.hookDecisions === 0) return [];
+
+  const lines = ["Used vs. missed (did the agent reach for it when it applied?)"];
+  for (const row of rows) {
+    const total = row.used + row.missed;
+    lines.push(
+      `  ${row.tool.padEnd(14)} used ${String(row.used).padEnd(5)} missed ${String(row.missed).padEnd(5)} coverage ${pct(row.used / total)}`,
+    );
+  }
+  if (overview.hookDecisions > 0) {
+    lines.push(`  bash hook      ${overview.hookDecisions} commands judged by the model without being asked`);
+  }
+  return lines;
 }
 
 export function formatCalibration(report: CalibrationReport, scope: string): string {

@@ -20,7 +20,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { getConfig } from "./config.ts";
-import type { LedgerDecision, LedgerEntry, LedgerLabel, LedgerShadowMiss } from "./types.ts";
+import type { LedgerDecision, LedgerEntry, LedgerLabel, LedgerOpportunity, LedgerShadowMiss } from "./types.ts";
 
 let warnedOnce = false;
 
@@ -141,6 +141,18 @@ export function recordShadowMiss(decisionId: string, item: string, via: string):
     decisionId,
     item,
     via,
+  };
+  append(entry);
+  return entry;
+}
+
+export function recordOpportunity(tool: LedgerOpportunity["tool"], detail: string): LedgerOpportunity {
+  const entry: LedgerOpportunity = {
+    kind: "opportunity",
+    id: newId("opp"),
+    ts: new Date().toISOString(),
+    tool,
+    detail,
   };
   append(entry);
   return entry;

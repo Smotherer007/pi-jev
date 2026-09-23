@@ -32,9 +32,11 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { configPath, getConfig, saveConfig } from "./src/config.ts";
+import { configPath, getConfig, saveConfig, type JevConfig } from "./src/config.ts";
 import { hardGuard } from "./src/guard.ts";
-import { findShadowMiss, readLedger, recordShadowMiss } from "./src/ledger.ts";
+import { classifyWithModel, isConsequential } from "./src/gate-model.ts";
+import { findShadowMiss, readLedger, recordOpportunity, recordShadowMiss } from "./src/ledger.ts";
+import { warmUp } from "./src/providers/index.ts";
 import {
   calibrationReport,
   joinLabels,
@@ -60,6 +62,80 @@ import { JevLabelTool } from "./src/tools/jev-label.ts";
  */
 const TOOLS = [JevSetupTool, JevStatusTool, JevDecideTool, JevTriageTool, JevVerifyTool, JevGateTool, JevLabelTool];
 
+/**
+ * The tools that need a provider to do anything. Without one they can only
+ * fail, and a tool that can only fail still costs prompt surface and a wrong
+ * turn when the model tries it — so they are hidden until a provider exists.
+ * jev_gate stays: its rule layer works with no provider at all.
+ */
+const PROVIDER_TOOLS = ["jev_decide", "jev_triage", "jev_verify"];
+
+let warmupEnabled = true;
+
+/** Test only: keep session_start from opening network connections. */
+export function _disableWarmup(): void {
+  warmupEnabled = false;
+}
+
+function hasProvider(config: JevConfig): boolean {
+  return config.providers.some((provider) => !provider.manual);
+}
+
+/**
+ * The section added to the system prompt.
+ *
+ * The per-tool guidelines are appended as loose bullets among everyone else's,
+ * and a model skims past them. This states the workflow once, in the order it
+ * applies, which is what makes a model reach for the tools at the right moment
+ * instead of only when it happens to remember them.
+ */
+export function promptSection(active: readonly string[]): string {
+  const has = (name: string) => active.includes(name);
+  const lines = [
+    "## Decision layer (pi-jev)",
+    "",
+    "You have a fast typed decision model (~100 ms per call, a fraction of a cent) for bounded judgements. " +
+      "Use it for the small decisions instead of spending turns and context on them yourself:",
+  ];
+  if (has("jev_triage")) {
+    lines.push(
+      "- Before reading: when a search or listing gives more than ~20 candidates, call jev_triage first and read only what survives. Do not read files speculatively to find out which matter.",
+    );
+  }
+  if (has("jev_gate")) {
+    lines.push(
+      "- Before acting: call jev_gate before a command whose effect is not obvious — remote systems, databases, history rewrites, deletes, deploys. Consequential bash commands are also checked automatically before they run.",
+    );
+  }
+  if (has("jev_verify")) {
+    lines.push(
+      "- Before reporting: after changing files, call jev_verify with your key claims as single checkable assertions before telling the user the work is done.",
+    );
+  }
+  if (has("jev_decide")) {
+    lines.push(
+      "- Any other bounded choice (classify, route, yes/no): jev_decide, with every question you already know you need in one call.",
+    );
+  }
+  lines.push("", "The decision model answers; you still reason and write everything the user reads.");
+  return lines.join("\n");
+}
+
+/** Count the result lines a search or listing produced, ignoring pi's own notes. */
+function countHits(content: ReadonlyArray<{ type: string; text?: string }>): number {
+  let count = 0;
+  for (const block of content) {
+    if (block.type !== "text" || typeof block.text !== "string") continue;
+    for (const line of block.text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      if (/^\[.*\]$/.test(trimmed) || /^\(.*\)$/.test(trimmed)) continue;
+      count += 1;
+    }
+  }
+  return count;
+}
+
 function reportText(scope: string, answers: LabelledAnswer[]): string {
   const pairs = answers.map((answer) => ({ p: answer.p, correct: answer.correct }));
   return formatCalibration(calibrationReport(pairs), scope);
@@ -81,10 +157,46 @@ export default function (pi: ExtensionAPI) {
 
   /* ------------------------------------------------------ config seeding */
 
+  /**
+   * Show or hide the tools that need a provider, to match the configuration.
+   * Runs at session start and again after jev_setup, so adding a provider makes
+   * them appear without a restart.
+   */
+  const hiddenByUs = new Set<string>();
+  const syncActiveTools = () => {
+    try {
+      const active = pi.getActiveTools();
+      // An empty list means pi has not settled its tools yet; setting one now
+      // would replace the whole set with ours.
+      if (active.length === 0) return;
+
+      let next: string[];
+      if (hasProvider(getConfig())) {
+        // Only bring back what this extension hid. A tool the user excluded on
+        // the command line (`pi -xt jev_verify`) stays excluded.
+        next = [...active, ...[...hiddenByUs].filter((name) => !active.includes(name))];
+        hiddenByUs.clear();
+      } else {
+        for (const name of PROVIDER_TOOLS) if (active.includes(name)) hiddenByUs.add(name);
+        next = active.filter((name) => !PROVIDER_TOOLS.includes(name));
+      }
+      if (next.length !== active.length) pi.setActiveTools(next);
+    } catch {
+      /* an older pi without tool activation: leave everything registered */
+    }
+  };
+
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
+    const config = getConfig();
+    syncActiveTools();
+
+    if (hasProvider(config) && warmupEnabled) {
+      // Not awaited: the session must not wait on a network round trip.
+      void warmUp();
+    }
+
     if (event.reason !== "startup") return;
 
-    const config = getConfig();
     const fresh = ensureConfigFile();
 
     if (!ctx.hasUI) return;
@@ -104,6 +216,25 @@ export default function (pi: ExtensionAPI) {
         .join(", ");
       ctx.ui.setStatus("jev-shadow", `jev shadow: ${active}`);
     }
+  });
+
+  /**
+   * The workflow, stated once in the system prompt, so the model reaches for
+   * the decision layer at the right moment rather than when it remembers to.
+   */
+  pi.on("before_agent_start", async (event) => {
+    const config = getConfig();
+    if (!config.prompt.inject || !hasProvider(config)) return;
+
+    let active: string[];
+    try {
+      active = pi.getActiveTools();
+    } catch {
+      active = TOOLS.map((tool) => tool.name);
+    }
+    if (!active.some((name) => name.startsWith("jev_"))) return;
+
+    return { systemPrompt: `${event.systemPrompt}\n\n${promptSection(active)}` };
   });
 
   /**
@@ -140,9 +271,9 @@ export default function (pi: ExtensionAPI) {
     if (command.trim().length === 0) return;
 
     const hard = hardGuard({ action: command });
-    // Nothing is certain about it, so this hook has no opinion. `jev_gate` still
-    // can, if the model asks.
-    if (!hard) return;
+    // Nothing is certain about it to the rules. Whether the decision model gets a
+    // say depends on hook.model; otherwise `jev_gate` still can, if asked.
+    if (!hard) return modelGate(command, config, ctx);
 
     const reason =
       `pi-jev: ${hard.verdict} · risk=${hard.risk} · blast=${hard.blast}/4 — ${hard.reason} ` +
@@ -157,6 +288,71 @@ export default function (pi: ExtensionAPI) {
       if (!allowed) return { block: true, reason: "pi-jev: the user declined this command." };
     }
   });
+
+  /**
+   * The model half of the hook: what the rules could not see, judged before the
+   * command runs instead of only when the agent thinks to ask.
+   *
+   * Speed is the constraint here, because this sits in front of every matching
+   * command. So: only consequential commands by default, a 2.5 s deadline,
+   * identical commands answered from the decision cache, and a provider that
+   * just failed skipped rather than waited on. A read-only `ls` never gets here.
+   *
+   * Fail-safe as everywhere else: an unreachable model means "confirm", never
+   * "allow". With no UI to ask through, confirm runs — the same relaxation, for
+   * the same reason, as the rule layer's confirm tier.
+   */
+  async function modelGate(command: string, config: JevConfig, ctx: ExtensionContext) {
+    if (config.hook.model === "off" || !hasProvider(config)) return;
+    if (config.hook.model === "consequential" && !isConsequential(command)) return;
+
+    const shadow = config.shadow.gate;
+    let verdict: "allow" | "confirm" | "block";
+    let summary: string;
+    try {
+      const result = await classifyWithModel({
+        action: command,
+        context: `bash in ${ctx.cwd}`,
+        // The configured policy decides, not a per-call ceiling: the hook has no
+        // caller with its own risk appetite.
+        allowedRisk: "needs_human",
+        tool: "jev_gate_hook",
+        shadow,
+      });
+      verdict = result.verdict;
+      summary =
+        `risk=${result.risk}${result.blast === null ? "" : ` · blast=${result.blast}/4`} · p=${result.p.toFixed(2)} · ` +
+        `${result.outcome.cached ? "cached" : `${result.outcome.latencyMs} ms`} · decision ${result.outcome.decisionId}` +
+        (result.rationale.length > 0 ? ` — ${result.rationale.join("; ")}` : "");
+    } catch (error) {
+      verdict = "confirm";
+      // "Every provider failed." followed by one line per provider; fold it into one.
+      const detail = (error as Error).message
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !/^Every provider failed/.test(line))
+        .join("; ");
+      summary = `the decision model could not be reached${detail ? ` (${detail})` : ""}`;
+    }
+
+    // Shadow mode: logged in the ledger, not acted on.
+    if (shadow || verdict === "allow") return;
+
+    const reason = `pi-jev: ${verdict} · ${summary}. The decision model judged this command before it ran.`;
+
+    if (verdict === "block") {
+      return {
+        block: true,
+        reason: `${reason} Ask the user rather than rephrasing the command until it passes.`,
+      };
+    }
+
+    if (ctx.hasUI) {
+      const allowed = await ctx.ui.confirm("pi-jev: the decision model wants a look", `${reason}\n\n${command}`);
+      if (!allowed) return { block: true, reason: "pi-jev: the user declined this command." };
+    }
+    return;
+  }
 
   /**
    * Shadow-miss detection.
@@ -183,6 +379,79 @@ export default function (pi: ExtensionAPI) {
     if (miss) {
       recordShadowMiss(miss.decisionId, miss.item, event.toolName);
     }
+  });
+
+  /* ------------------------------------------ is the layer actually used? */
+
+  /**
+   * Per agent run: search results big enough to triage that nobody triaged, and
+   * edits that nobody verified. Flushed to the ledger when the run ends, so a
+   * triage that follows the hint a moment later cancels its opportunity instead
+   * of being counted as both a use and a miss.
+   */
+  const run = { pendingTriage: [] as string[], edits: 0, verified: false };
+
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "jev_triage") run.pendingTriage.shift();
+    else if (event.toolName === "jev_verify") run.verified = true;
+    else if (event.toolName === "edit" || event.toolName === "write") run.edits += 1;
+  });
+
+  pi.on("agent_end", async () => {
+    const config = getConfig();
+    if (config.hook.opportunities && hasProvider(config)) {
+      for (const detail of run.pendingTriage) recordOpportunity("jev_triage", detail);
+      if (run.edits > 0 && !run.verified) {
+        recordOpportunity("jev_verify", `${run.edits} edit${run.edits === 1 ? "" : "s"}, no verify`);
+      }
+    }
+    run.pendingTriage = [];
+    run.edits = 0;
+    run.verified = false;
+  });
+
+  /**
+   * The triage hint, placed where it changes behaviour: on the search result
+   * itself, at the moment the agent decides what to read next. One line, and
+   * only past the threshold, so a normal search is left alone.
+   */
+  pi.on("tool_result", async (event) => {
+    if (event.toolName === "jev_setup") {
+      syncActiveTools();
+      return;
+    }
+    // Not ls: a directory listing is orientation, and a hint on every large one
+    // would be noise the model learns to ignore — hints included.
+    if (event.toolName !== "grep" && event.toolName !== "find") return;
+    if (event.isError) return;
+
+    const config = getConfig();
+    const threshold = config.hook.triageHintAt;
+    if (threshold <= 0 || !hasProvider(config)) return;
+
+    const hits = countHits(event.content as Array<{ type: string; text?: string }>);
+    if (hits < threshold) return;
+
+    run.pendingTriage.push(`${event.toolName}: ${hits} results`);
+
+    const input = event.input as { pattern?: unknown; path?: unknown };
+    const pattern = typeof input.pattern === "string" && event.toolName === "grep" ? input.pattern : undefined;
+    const root = typeof input.path === "string" ? input.path : undefined;
+    const args = [
+      'question="<what you are looking for>"',
+      ...(pattern ? [`pattern=${JSON.stringify(pattern)}`] : []),
+      ...(root ? [`root=${JSON.stringify(root)}`] : []),
+    ].join(" ");
+
+    return {
+      content: [
+        ...event.content,
+        {
+          type: "text" as const,
+          text: `\n[pi-jev] ${hits} results. Before reading any of them, jev_triage ${args} filters them down to the few that matter in one ~100 ms call.`,
+        },
+      ],
+    };
   });
 
   /* ------------------------------------------------------------- commands */

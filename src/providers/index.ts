@@ -69,6 +69,121 @@ export interface DecideOutcome {
   attempts: Array<{ provider: string; error: string }>;
   /** True when a later provider in the chain answered. */
   fellBack: boolean;
+  /**
+   * True when the answer came from the in-memory cache: an identical question
+   * over an identical state, asked recently. No provider was called, nothing
+   * was charged and nothing new was written to the ledger.
+   */
+  cached?: boolean;
+}
+
+/* ------------------------------------------------------------ speed layer */
+
+/**
+ * Two small memories that exist only to make decisions faster.
+ *
+ * The cache: the bash hook and repeated triage runs ask the same question about
+ * the same state over and over in one session. The second answer is served from
+ * memory in microseconds instead of a round trip, and is not written to the
+ * ledger again — it is the same decision, not a new observation, and counting it
+ * twice would skew calibration towards whatever gets asked most.
+ *
+ * The cooldown: a provider that just failed is skipped for a while. Without it, a
+ * hosted provider that is down costs its full timeout on every decision before
+ * the chain falls through to the local one; with it, it costs one.
+ *
+ * Both are keyed on the provider's id *and* URL and model, so reconfiguring a
+ * provider is never answered from the previous configuration's memory.
+ */
+const CACHE_MAX_ENTRIES = 500;
+const decisionCache = new Map<string, { at: number; outcome: DecideOutcome }>();
+const cooldowns = new Map<string, number>();
+
+function providerKey(entry: ProviderEntry): string {
+  return `${entry.id}|${entry.baseUrl ?? ""}|${entry.model ?? ""}`;
+}
+
+function cacheKey(options: DecideOptions, chain: readonly ProviderEntry[]): string {
+  return [
+    options.tool,
+    options.shadow ? "shadow" : "live",
+    chain.map(providerKey).join(","),
+    hashState(options.state),
+    hashState(options.questions),
+  ].join("\u0000");
+}
+
+function cacheGet(key: string, ttlMs: number): DecideOutcome | null {
+  if (ttlMs <= 0) return null;
+  const hit = decisionCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > ttlMs) {
+    decisionCache.delete(key);
+    return null;
+  }
+  return hit.outcome;
+}
+
+function cachePut(key: string, outcome: DecideOutcome, ttlMs: number): void {
+  if (ttlMs <= 0) return;
+  // A degraded answer is a guess standing in for a probability; serving it again
+  // would repeat the guess without the chance of a real answer this time.
+  if (outcome.degraded) return;
+  decisionCache.set(key, { at: Date.now(), outcome });
+  // Map iteration order is insertion order, so the first key is the oldest.
+  while (decisionCache.size > CACHE_MAX_ENTRIES) {
+    const oldest = decisionCache.keys().next().value;
+    if (oldest === undefined) break;
+    decisionCache.delete(oldest);
+  }
+}
+
+function coolingDown(entry: ProviderEntry, cooldownMs: number): number | null {
+  if (cooldownMs <= 0) return null;
+  const until = cooldowns.get(providerKey(entry));
+  if (until === undefined) return null;
+  const remaining = until - Date.now();
+  if (remaining <= 0) {
+    cooldowns.delete(providerKey(entry));
+    return null;
+  }
+  return remaining;
+}
+
+/**
+ * Open a connection to the first provider in the chain before the first real
+ * decision needs it, so that decision does not also pay for DNS, TCP and TLS.
+ * A provider that turns out to be unreachable goes straight into cooldown, so
+ * the first decision falls through to the next provider instead of waiting out
+ * a timeout. Never throws.
+ */
+export async function warmUp(): Promise<void> {
+  const config = getConfig();
+  const entry = providerChain(config)[0];
+  if (!entry) return;
+  try {
+    const health = await buildProvider(entry).available();
+    if (!health.ok && config.limits.providerCooldownMs > 0 && /unreachable/i.test(health.detail)) {
+      cooldowns.set(providerKey(entry), Date.now() + config.limits.providerCooldownMs);
+    }
+  } catch {
+    /* a warm-up is an optimisation; it has nothing to report */
+  }
+}
+
+/** Forget cached answers and cooldowns. Test only, and for `/jev-providers`. */
+export function _resetDecisionMemory(): void {
+  decisionCache.clear();
+  cooldowns.clear();
+}
+
+/** How many decisions are cached and which providers are cooling down. */
+export function decisionMemoryStats(): { cached: number; coolingDown: string[] } {
+  const now = Date.now();
+  return {
+    cached: decisionCache.size,
+    coolingDown: [...cooldowns.entries()].filter(([, until]) => until > now).map(([key]) => key.split("|")[0] ?? key),
+  };
 }
 
 /** Rough character cost of the state, used to record size next to the hash. */
@@ -86,10 +201,27 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
     );
   }
 
+  const key = cacheKey(options, chain);
+  const hit = cacheGet(key, config.limits.cacheTtlMs);
+  if (hit) {
+    return { ...hit, latencyMs: 0, costUsd: 0, attempts: [], cached: true };
+  }
+
   const attempts: Array<{ provider: string; error: string }> = [];
   const stateText = typeof options.state === "string" ? options.state : JSON.stringify(options.state) ?? "";
 
   for (const [index, entry] of chain.entries()) {
+    // An explicitly requested provider is always tried: the caller asked for it
+    // by name, and skipping it would answer a different question.
+    const remaining = options.providerId ? null : coolingDown(entry, config.limits.providerCooldownMs);
+    if (remaining !== null) {
+      attempts.push({
+        provider: entry.id,
+        error: `skipped: failed recently, retrying in ${Math.ceil(remaining / 1000)} s`,
+      });
+      continue;
+    }
+
     const provider = buildProvider(entry);
     const started = Date.now();
 
@@ -140,7 +272,8 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
         ...(response.raw ? { schemaViolation: "provider reported no usable probability" } : {}),
       });
 
-      return {
+      cooldowns.delete(providerKey(entry));
+      const outcome: DecideOutcome = {
         decisionId,
         provider: provider.id,
         model: response.model,
@@ -152,8 +285,14 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
         attempts,
         fellBack: index > 0,
       };
+      cachePut(key, outcome, config.limits.cacheTtlMs);
+      return outcome;
     } catch (error) {
       attempts.push({ provider: provider.id, error: (error as Error).message });
+      // The caller cancelling is not the provider failing, so it earns no cooldown.
+      if (!options.signal?.aborted && config.limits.providerCooldownMs > 0) {
+        cooldowns.set(providerKey(entry), Date.now() + config.limits.providerCooldownMs);
+      }
       // No retry on the same provider: Jev has no idempotency key, so a second
       // attempt may be charged twice. Move along the chain and let the caller
       // see which providers failed and why.

@@ -165,6 +165,31 @@ Run in shadow until that number is boringly low, then turn it off.
 
 ---
 
+## Making sure it is actually used
+
+A tool the model has to remember to call is a tool it mostly does not call. So
+pi-jev does not rely on the per-tool guidelines alone:
+
+| | What happens | Switch |
+|---|---|---|
+| **System prompt** | One short section states the workflow — triage before reading, gate before acting, verify before reporting — naming only the jev_* tools that are active. | `prompt.inject` |
+| **Triage hint** | A `grep` or `find` with 20+ results gets one line appended, with the pattern already filled in: the moment the agent decides what to read next. | `hook.triageHintAt` |
+| **Model in the bash hook** | Consequential commands the rules cannot judge (pushes, cloud CLIs, databases, remote shells, publishes, deploys) are classified by the model *before they run*, with the same policy and fail-safe as `jev_gate`. Everyday local commands never pay for a call. | `hook.model` |
+| **Used vs. missed** | Large search results nobody triaged and edits nobody verified are recorded per agent run. `/jev` shows coverage per tool, so "is it used?" is a number, not a feeling. | `hook.opportunities` |
+| **No dead tools** | Without a provider, `jev_triage`, `jev_verify` and `jev_decide` are hidden instead of failing; `jev_setup` brings them back. Tools you excluded with `-xt` stay excluded. | — |
+
+## Keeping decisions fast
+
+The decision layer sits in front of real work, so its latency is the agent's latency.
+
+- **Rules first.** Read-only commands and unambiguous danger are decided by regex in microseconds; the model is never called for them.
+- **Decision cache.** An identical question over an identical state (the same command, the same triage) is answered from memory for `cacheTtlMs`, not charged and not logged twice.
+- **Provider cooldown.** A provider that just failed is skipped for `providerCooldownMs`, so a down hosted provider costs one timeout, not one per decision, and the local fallback answers immediately.
+- **Warm-up.** At session start the first provider is contacted in the background, so the first real decision does not also pay for DNS and TLS — and an unreachable one is known before it is needed.
+- **Parallel triage.** Chunks of candidates run side by side (`concurrency`), so 200 candidates take about one round trip instead of five. The reported latency is wall-clock.
+
+---
+
 ## Does it actually work? Measure it, do not assume it
 
 Every decision is written to `~/.pi/jev-ledger.jsonl` — provider, model,
@@ -238,7 +263,10 @@ confidence being invented. Nothing downstream depends on a guess.
     "maxStateChars": 60000,   // reject states bigger than this rather than truncating silently
     "maxKeep": 8,             // triage survivors returned
     "minConfidence": 0.5,     // triage filter threshold
-    "gateTimeoutMs": 2500     // gate deadline; on timeout the verdict is "confirm"
+    "gateTimeoutMs": 2500,    // gate deadline; on timeout the verdict is "confirm"
+    "concurrency": 4,         // triage chunks in flight at once
+    "cacheTtlMs": 600000,     // identical decisions answered from memory for this long; 0 = off
+    "providerCooldownMs": 30000 // a provider that failed is skipped this long; 0 = off
   },
   "verify": { "supportedAt": 0.7, "refutedAt": 0.3 },
   "gate": {
@@ -247,7 +275,13 @@ confidence being invented. Nothing downstream depends on a guess.
     "destructive": "block",
     "needs_human": "confirm"
   },
-  "hook": { "bash": true }, // apply the deterministic rules to every bash call, not only to jev_gate
+  "hook": {
+    "bash": true,             // apply the deterministic rules to every bash call, not only to jev_gate
+    "model": "consequential", // also ask the model about bash commands the rules left open: off | consequential | all
+    "triageHintAt": 20,       // append a jev_triage hint to grep/find results this large; 0 = off
+    "opportunities": true     // record missed triages and verifies, so /jev shows used vs. missed
+  },
+  "prompt": { "inject": true }, // add the decision-layer workflow to the system prompt
   "shadow": { "triage": false, "verify": false, "gate": false },
   "ledger": { "maxBytes": 8388608, "keepEntries": 5000 }
 }
@@ -266,13 +300,14 @@ guesses. The ledger exists to replace them with measured ones.
 
 ```bash
 npm install
-npm test        # 274 tests, no network required
+npm test        # 300 tests, no network required
 npm run typecheck
 ```
 
 ```
 index.ts              tools, commands, event wiring
 src/guard.ts          deterministic risk rules
+src/gate-model.ts     the model half of the gate, shared by jev_gate and the bash hook
 src/candidates.ts     zero-token candidate generation
 src/questions.ts      request building, tolerant answer parsing
 src/calibration.ts    Brier, ECE, reliability, threshold sweep

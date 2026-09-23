@@ -164,7 +164,23 @@ export interface LedgerShadowMiss {
   via: string;
 }
 
-export type LedgerEntry = LedgerDecision | LedgerLabel | LedgerShadowMiss;
+/**
+ * Recorded when the agent did work the decision layer was built for, without
+ * it: read through a large search result instead of triaging it, or finished a
+ * run with edits and no verify. Not a failure — a count, so `/jev` can say how
+ * much of the work actually went through Jev instead of assuming it did.
+ */
+export interface LedgerOpportunity {
+  kind: "opportunity";
+  id: string;
+  ts: string;
+  /** The jev_* tool that would have applied. */
+  tool: "jev_triage" | "jev_verify";
+  /** What happened instead, e.g. "grep: 57 hits" or "3 edits, no verify". */
+  detail: string;
+}
+
+export type LedgerEntry = LedgerDecision | LedgerLabel | LedgerShadowMiss | LedgerOpportunity;
 
 /* ------------------------------------------------------------------- risks */
 

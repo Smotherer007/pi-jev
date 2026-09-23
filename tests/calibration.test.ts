@@ -278,3 +278,25 @@ describe("ledgerOverview", () => {
     assert.equal(ledgerOverview(entries).decisions, 1);
   });
 });
+
+describe("used versus missed", () => {
+  it("counts one triage call once, however many chunks it wrote", () => {
+    const entries: LedgerEntry[] = [
+      decision({ id: "d1", tool: "jev_triage", purpose: "triage: auth", ts: "2026-09-19T10:00:00.000Z" }),
+      decision({ id: "d2", tool: "jev_triage", purpose: "triage: auth", ts: "2026-09-19T10:00:00.400Z" }),
+      decision({ id: "d3", tool: "jev_triage", purpose: "triage: billing", ts: "2026-09-19T10:05:00.000Z" }),
+      decision({ id: "d4", tool: "jev_verify" }),
+      decision({ id: "d5", tool: "jev_gate_hook" }),
+      { kind: "opportunity", id: "o1", ts: "2026-09-19T11:00:00.000Z", tool: "jev_triage", detail: "grep: 40 results" },
+      { kind: "opportunity", id: "o2", ts: "2026-09-19T11:00:00.000Z", tool: "jev_verify", detail: "2 edits, no verify" },
+    ];
+    const overview = ledgerOverview(entries);
+    assert.deepEqual(overview.usage, [
+      { tool: "jev_triage", used: 2, missed: 1 },
+      { tool: "jev_verify", used: 1, missed: 1 },
+    ]);
+    assert.equal(overview.hookDecisions, 1);
+    // Opportunities are not decisions.
+    assert.equal(overview.decisions, 5);
+  });
+});

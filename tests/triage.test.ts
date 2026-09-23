@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { questionFor } from "../src/tools/jev-triage.ts";
+import { mapConcurrent, questionFor } from "../src/tools/jev-triage.ts";
 import type { Candidate } from "../src/candidates.ts";
 
 const candidate: Candidate = { key: "src/auth.ts", path: "src/auth.ts", preview: "export function login" };
@@ -43,5 +43,38 @@ describe("the triage question", () => {
     assert.equal(question.id, "c7");
     assert.match(question.instructions, /src\/billing\.ts/);
     assert.match(question.instructions, /where are invoices built\?/);
+  });
+});
+
+describe("running chunks side by side", () => {
+  it("keeps input order whatever order the calls finish in", async () => {
+    const delays = [30, 5, 20, 1];
+    const out = await mapConcurrent(delays, 4, async (ms) => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return ms;
+    });
+    assert.deepEqual(out, delays);
+  });
+
+  it("never has more than the limit in flight", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    await mapConcurrent([1, 2, 3, 4, 5, 6, 7], 3, async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+    });
+    assert.equal(peak, 3);
+  });
+
+  it("takes about as long as the slowest call, not the sum", async () => {
+    const started = Date.now();
+    await mapConcurrent([40, 40, 40, 40], 4, (ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    assert.ok(Date.now() - started < 120);
+  });
+
+  it("copes with an empty list", async () => {
+    assert.deepEqual(await mapConcurrent([], 4, async () => 1), []);
   });
 });

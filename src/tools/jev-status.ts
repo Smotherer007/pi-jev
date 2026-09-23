@@ -9,7 +9,7 @@
 import { Type } from "typebox";
 
 import { configPath, getConfig, maskKey } from "../config.ts";
-import { chainHealth } from "../providers/index.ts";
+import { chainHealth, decisionMemoryStats } from "../providers/index.ts";
 import { ledgerPath, readLedger } from "../ledger.ts";
 import { ledgerOverview } from "../calibration.ts";
 import { formatOverview } from "../format.ts";
@@ -38,12 +38,20 @@ export async function describeStatus(params: StatusParams = {}): Promise<string>
   lines.push(
     `limits   maxStateChars=${config.limits.maxStateChars} maxKeep=${config.limits.maxKeep} minConfidence=${config.limits.minConfidence} gateTimeoutMs=${config.limits.gateTimeoutMs}`,
   );
+  const memory = decisionMemoryStats();
+  lines.push(
+    `speed    concurrency=${config.limits.concurrency} cacheTtlMs=${config.limits.cacheTtlMs} (${memory.cached} cached) providerCooldownMs=${config.limits.providerCooldownMs}` +
+      (memory.coolingDown.length > 0 ? ` · cooling down: ${memory.coolingDown.join(", ")}` : ""),
+  );
   lines.push(`verify   supported ≥ ${config.verify.supportedAt} · refuted ≤ ${config.verify.refutedAt}`);
   lines.push(
     `gate     read_only=${config.gate.read_only} reversible=${config.gate.reversible} destructive=${config.gate.destructive} needs_human=${config.gate.needs_human}`,
   );
   lines.push(
     `hook     bash=${config.hook.bash ? "on" : "off"}${config.hook.bash ? " (the deterministic rules run before every bash call)" : " (the rules are only consulted when jev_gate is called)"}`,
+  );
+  lines.push(
+    `         model=${config.hook.model} triageHintAt=${config.hook.triageHintAt} opportunities=${config.hook.opportunities ? "on" : "off"} · prompt.inject=${config.prompt.inject ? "on" : "off"}`,
   );
   lines.push("");
 

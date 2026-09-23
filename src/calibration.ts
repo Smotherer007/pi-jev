@@ -226,6 +226,14 @@ export interface LedgerOverview {
   byTool: Array<{ tool: string; n: number }>;
   firstTs: string | null;
   lastTs: string | null;
+  /**
+   * How much of the work went through the decision layer: per tool, how often it
+   * was used and how often the agent did the same job without it. `missed` is
+   * only counted for the tools pi-jev can observe an opportunity for.
+   */
+  usage: Array<{ tool: string; used: number; missed: number }>;
+  /** Decisions the bash hook made on its own, without the agent asking. */
+  hookDecisions: number;
 }
 
 export function ledgerOverview(entries: readonly LedgerEntry[]): LedgerOverview {
@@ -284,5 +292,42 @@ export function ledgerOverview(entries: readonly LedgerEntry[]): LedgerOverview 
     byTool: [...toolMap.entries()].map(([tool, n]) => ({ tool, n })).sort((a, b) => b.n - a.n),
     firstTs: timestamps[0] ?? null,
     lastTs: timestamps[timestamps.length - 1] ?? null,
+    usage: usageRows(decisions, entries),
+    hookDecisions: toolMap.get("jev_gate_hook") ?? 0,
   };
+}
+
+/**
+ * Used versus missed, per tool that has an observable opportunity.
+ *
+ * Triage decisions are counted per call, not per chunk: one triage over 200
+ * candidates writes several decisions with the same purpose within a second, and
+ * counting those as several uses would flatter the ratio.
+ */
+function usageRows(
+  decisions: readonly LedgerDecision[],
+  entries: readonly LedgerEntry[],
+): Array<{ tool: string; used: number; missed: number }> {
+  const missed = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.kind === "opportunity") missed.set(entry.tool, (missed.get(entry.tool) ?? 0) + 1);
+  }
+
+  const used = new Map<string, number>();
+  let lastTriage: { purpose: string; at: number } | null = null;
+  for (const decision of decisions) {
+    if (decision.tool === "jev_triage") {
+      const at = Date.parse(decision.ts);
+      const sameCall = lastTriage && lastTriage.purpose === decision.purpose && Math.abs(at - lastTriage.at) < 5_000;
+      lastTriage = { purpose: decision.purpose, at };
+      if (sameCall) continue;
+    }
+    used.set(decision.tool, (used.get(decision.tool) ?? 0) + 1);
+  }
+
+  return ["jev_triage", "jev_verify"].map((tool) => ({
+    tool,
+    used: used.get(tool) ?? 0,
+    missed: missed.get(tool) ?? 0,
+  }));
 }

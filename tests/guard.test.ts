@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import { hardGuard, ruleCount } from "../src/guard.ts";
+import { isConsequential } from "../src/gate-model.ts";
 
 describe("rules that must fire", () => {
   const blocked: Array<[string, string]> = [
@@ -166,5 +167,42 @@ describe("robustness", () => {
   it("is case-insensitive where it should be", () => {
     assert.equal(hardGuard({ action: "drop table users" })?.verdict, "block");
     assert.equal(hardGuard({ action: "GIT RESET --hard" }), null, "git subcommands are case-sensitive");
+  });
+});
+
+
+describe("which commands the hook sends to the model", () => {
+  it("routes commands that reach past the working tree", () => {
+    for (const command of [
+      "git push origin main",
+      "git reset --hard HEAD~3",
+      "terraform apply",
+      "aws s3 rm s3://bucket/key",
+      "psql -c 'delete from users'",
+      "ssh prod 'systemctl restart app'",
+      "curl -X DELETE https://api.example.com/x",
+      "npm publish",
+      "rm build/output.js",
+      "find . -name '*.log' -delete",
+      "npm run migrate",
+    ]) {
+      assert.equal(isConsequential(command), true, command);
+    }
+  });
+
+  it("leaves everyday local commands alone, because each one would cost a round trip", () => {
+    for (const command of [
+      "ls -la",
+      "git status",
+      "git diff HEAD",
+      "npm test",
+      "grep -rn foo src",
+      "cat README.md",
+      "find . -name '*.ts' -exec grep -l foo {} +",
+      "curl https://example.com",
+      "mv a.ts b.ts",
+    ]) {
+      assert.equal(isConsequential(command), false, command);
+    }
   });
 });

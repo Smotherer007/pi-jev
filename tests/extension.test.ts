@@ -6,8 +6,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import extension from "../index.ts";
+import extension, { _disableWarmup, promptSection } from "../index.ts";
 import { _resetConfigCache } from "../src/config.ts";
+import { _resetDecisionMemory } from "../src/providers/index.ts";
 import { _resetDropMemory, readLedger, rememberDrops } from "../src/ledger.ts";
 
 /**
@@ -78,6 +79,9 @@ function fakeContext(cwd: string) {
   };
 }
 
+// session_start would otherwise open a connection to whatever a test configured.
+_disableWarmup();
+
 let home: string;
 let notifications: string[];
 let statuses: Array<{ key: string; text: string | undefined }>;
@@ -90,6 +94,8 @@ beforeEach(() => {
   _resetConfigCache();
   // Same for the dropped-path memory, which is what shadow-miss matching reads.
   _resetDropMemory();
+  // Cached answers and provider cooldowns are process-wide too.
+  _resetDecisionMemory();
   notifications = [];
   statuses = [];
 });
@@ -184,9 +190,12 @@ describe("extension factory", () => {
     const pi = makeFakePi();
     extension(pi.api as never);
     assert.equal(pi.handlers.get("session_start")?.length, 1);
-    // The guard and shadow-miss detection, in that order: a dangerous command is
-    // refused before anything else looks at it.
-    assert.equal(pi.handlers.get("tool_call")?.length, 2);
+    // The guard, shadow-miss detection and usage bookkeeping, in that order: a
+    // dangerous command is refused before anything else looks at it.
+    assert.equal(pi.handlers.get("tool_call")?.length, 3);
+    assert.equal(pi.handlers.get("before_agent_start")?.length, 1);
+    assert.equal(pi.handlers.get("tool_result")?.length, 1);
+    assert.equal(pi.handlers.get("agent_end")?.length, 1);
   });
 });
 
@@ -721,5 +730,246 @@ describe("jev_gate against a reachable decision model", () => {
     const result = await callGate(pi, "rm -rf /");
     assert.equal(result.details.source, "rule");
     assert.equal(result.details.verdict, "block");
+  });
+});
+
+/* ------------------------------------------ the decision layer, put to use */
+
+const READ_ONLY_ANSWERS = {
+  risk: {
+    type: "choice",
+    choice: "read_only",
+    confidence: 0.95,
+    probabilities: { read_only: 0.95, reversible: 0.03, destructive: 0.01, needs_human: 0.01 },
+  },
+  blast: { type: "score", score: 0.05, confidence: 0.95, probabilities: { 0: 0.95, 1: 0.05, 2: 0, 3: 0 } },
+};
+
+function withProviderConfig(extra: Record<string, unknown> = {}, url = "http://127.0.0.1:1/v1"): void {
+  const configPath = path.join(home, ".pi", "jev-config.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      providers: [{ id: "stub", kind: "jev", baseUrl: url, model: "stub", apiKey: "x" }],
+      limits: { gateTimeoutMs: 2_000 },
+      ...extra,
+    }),
+    "utf-8",
+  );
+  _resetConfigCache();
+}
+
+describe("the bash hook asks the decision model", () => {
+  it("blocks a consequential command the model judges too far-reaching", async () => {
+    await withDecisionStub(jevResponse(STUB_ANSWERS), async (url, bodies) => {
+      writeStubConfig(url, "jev");
+      const pi = makeFakePi();
+      extension(pi.api as never);
+
+      const result = (await toolCallHandler(pi, "guard")(
+        { toolName: "bash", input: { command: "git push origin main" } },
+        fakeContext(home),
+      )) as BlockedCall | undefined;
+
+      assert.equal(bodies.length, 1, "the model must be asked before the command runs");
+      assert.equal(result?.block, true);
+      assert.match(result?.reason ?? "", /decision model judged this command/);
+      const hook = readLedger().filter((entry) => entry.kind === "decision");
+      assert.equal(hook[0]?.kind === "decision" ? hook[0].tool : "", "jev_gate_hook");
+    });
+  });
+
+  it("lets a command through when the model clears it, and asks only once for a repeat", async () => {
+    await withDecisionStub(jevResponse(READ_ONLY_ANSWERS), async (url, bodies) => {
+      writeStubConfig(url, "jev");
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      const handler = toolCallHandler(pi, "guard");
+
+      // Not a command the read-only rules already clear on their own.
+      const event = { toolName: "bash", input: { command: "aws s3 ls" } };
+      assert.equal(await handler(event, fakeContext(home)), undefined);
+      assert.equal(await handler(event, fakeContext(home)), undefined);
+      // The second identical command is answered from the decision cache.
+      assert.equal(bodies.length, 1);
+      assert.equal(readLedger().filter((entry) => entry.kind === "decision").length, 1);
+    });
+  });
+
+  it("does not spend a model call on a command that cannot reach past the working tree", async () => {
+    await withDecisionStub(jevResponse(STUB_ANSWERS), async (url, bodies) => {
+      writeStubConfig(url, "jev");
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      const handler = toolCallHandler(pi, "guard");
+
+      for (const command of ["ls -la", "git status", "npm test", "grep -rn foo src", "cat README.md"]) {
+        assert.equal(await handler({ toolName: "bash", input: { command } }, fakeContext(home)), undefined);
+      }
+      assert.equal(bodies.length, 0);
+    });
+  });
+
+  it("asks the user when the model cannot be reached, and skips the dead provider next time", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    const ctx = fakeContext(home);
+    const asked: string[] = [];
+    ctx.ui.confirm = async (_title: string, message?: string) => {
+      asked.push(message ?? "");
+      return true;
+    };
+
+    const handler = toolCallHandler(pi, "guard");
+    assert.equal(await handler({ toolName: "bash", input: { command: "terraform apply" } }, ctx), undefined);
+    assert.equal(asked.length, 1);
+    assert.match(asked[0] ?? "", /could not be reached/);
+
+    const started = Date.now();
+    await handler({ toolName: "bash", input: { command: "terraform destroy -target=x" } }, ctx);
+    assert.match(asked[1] ?? "", /failed recently/);
+    assert.ok(Date.now() - started < 200, "a provider in cooldown must not be waited on");
+  });
+
+  it("stays out of the way when hook.model is off", async () => {
+    await withDecisionStub(jevResponse(STUB_ANSWERS), async (url, bodies) => {
+      withProviderConfig({ hook: { model: "off" } }, url);
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      assert.equal(
+        await toolCallHandler(pi, "guard")({ toolName: "bash", input: { command: "git push" } }, fakeContext(home)),
+        undefined,
+      );
+      assert.equal(bodies.length, 0);
+    });
+  });
+
+  it("logs but does not act in shadow mode", async () => {
+    await withDecisionStub(jevResponse(STUB_ANSWERS), async (url, bodies) => {
+      withProviderConfig({ shadow: { gate: true } }, url);
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      assert.equal(
+        await toolCallHandler(pi, "guard")({ toolName: "bash", input: { command: "git push" } }, fakeContext(home)),
+        undefined,
+      );
+      assert.equal(bodies.length, 1);
+    });
+  });
+});
+
+describe("the system prompt section", () => {
+  const beforeStart = (pi: FakePi) =>
+    pi.handlers.get("before_agent_start")?.[0] as (event: unknown, ctx: unknown) => Promise<{ systemPrompt?: string } | undefined>;
+
+  it("states the workflow once a provider is configured", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    pi.api.getActiveTools = () => ["read", "bash", "jev_triage", "jev_gate", "jev_verify", "jev_decide"];
+    extension(pi.api as never);
+
+    const result = await beforeStart(pi)({ systemPrompt: "BASE", prompt: "hi" }, fakeContext(home));
+    assert.ok(result?.systemPrompt?.startsWith("BASE"));
+    assert.match(result?.systemPrompt ?? "", /jev_triage first/);
+    assert.match(result?.systemPrompt ?? "", /jev_verify/);
+  });
+
+  it("only mentions tools that are active", () => {
+    const text = promptSection(["jev_gate"]);
+    assert.match(text, /jev_gate/);
+    assert.doesNotMatch(text, /jev_triage|jev_verify|jev_decide/);
+  });
+
+  it("adds nothing without a provider, or when switched off", async () => {
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    assert.equal(await beforeStart(pi)({ systemPrompt: "BASE" }, fakeContext(home)), undefined);
+
+    withProviderConfig({ prompt: { inject: false } });
+    assert.equal(await beforeStart(pi)({ systemPrompt: "BASE" }, fakeContext(home)), undefined);
+  });
+});
+
+describe("the triage hint and the usage count", () => {
+  const toolResult = (pi: FakePi) =>
+    pi.handlers.get("tool_result")?.[0] as (event: unknown, ctx: unknown) => Promise<{ content?: Array<{ text?: string }> } | undefined>;
+  const usage = (pi: FakePi) => (pi.handlers.get("tool_call") ?? [])[2] as (event: unknown, ctx: unknown) => Promise<unknown>;
+  const agentEnd = (pi: FakePi) => pi.handlers.get("agent_end")?.[0] as (event: unknown, ctx: unknown) => Promise<unknown>;
+
+  const grepResult = (hits: number) => ({
+    toolName: "grep",
+    isError: false,
+    input: { pattern: "billing", path: "src" },
+    content: [{ type: "text", text: Array.from({ length: hits }, (_, i) => `src/f${i}.ts:1: billing`).join("\n") }],
+  });
+
+  it("points at jev_triage on a large search result, with the pattern already filled in", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    extension(pi.api as never);
+
+    const result = await toolResult(pi)(grepResult(40), fakeContext(home));
+    const last = result?.content?.at(-1)?.text ?? "";
+    assert.match(last, /40 results/);
+    assert.match(last, /jev_triage/);
+    assert.match(last, /pattern="billing"/);
+  });
+
+  it("leaves a small result alone", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    extension(pi.api as never);
+    assert.equal(await toolResult(pi)(grepResult(5), fakeContext(home)), undefined);
+  });
+
+  it("records a missed triage and a missed verify when the run ends", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    extension(pi.api as never);
+
+    await toolResult(pi)(grepResult(40), fakeContext(home));
+    await usage(pi)({ toolName: "edit", input: {} }, fakeContext(home));
+    await agentEnd(pi)({ messages: [] }, fakeContext(home));
+
+    const missed = readLedger().filter((entry) => entry.kind === "opportunity");
+    assert.deepEqual(missed.map((entry) => (entry.kind === "opportunity" ? entry.tool : "")).sort(), ["jev_triage", "jev_verify"]);
+  });
+
+  it("does not count a miss when the agent follows the hint", async () => {
+    withProviderConfig();
+    const pi = makeFakePi();
+    extension(pi.api as never);
+
+    await toolResult(pi)(grepResult(40), fakeContext(home));
+    await usage(pi)({ toolName: "jev_triage", input: {} }, fakeContext(home));
+    await usage(pi)({ toolName: "write", input: {} }, fakeContext(home));
+    await usage(pi)({ toolName: "jev_verify", input: {} }, fakeContext(home));
+    await agentEnd(pi)({ messages: [] }, fakeContext(home));
+
+    assert.equal(readLedger().filter((entry) => entry.kind === "opportunity").length, 0);
+  });
+});
+
+describe("tool activation", () => {
+  it("hides the provider-only tools until a provider exists, and brings back only those", async () => {
+    const pi = makeFakePi();
+    let active = ["read", "bash", "jev_gate", "jev_triage", "jev_decide"]; // jev_verify excluded by the user
+    pi.api.getActiveTools = () => active;
+    pi.api.setActiveTools = (names: string[]) => {
+      active = names;
+    };
+    extension(pi.api as never);
+
+    await pi.handlers.get("session_start")?.[0]?.({ reason: "resume" }, fakeContext(home));
+    assert.deepEqual(active, ["read", "bash", "jev_gate"]);
+
+    withProviderConfig();
+    await (pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<unknown>)(
+      { toolName: "jev_setup", isError: false, input: {}, content: [] },
+      fakeContext(home),
+    );
+    assert.deepEqual([...active].sort(), ["bash", "jev_decide", "jev_gate", "jev_triage", "read"]);
   });
 });

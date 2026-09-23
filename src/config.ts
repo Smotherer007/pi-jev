@@ -17,6 +17,8 @@ import * as path from "node:path";
 import type { GateVerdict, RiskClass } from "./types.ts";
 import { RISK_CLASSES } from "./types.ts";
 
+export type HookModelMode = "off" | "consequential" | "all";
+
 export type ProviderKind = "jev" | "ollama" | "openai-compat";
 
 export interface ProviderEntry {
@@ -56,6 +58,25 @@ export interface JevConfig {
      * triage and wrong here — on timeout the verdict falls back to "confirm".
      */
     gateTimeoutMs: number;
+    /**
+     * How many provider calls one triage may have in flight at once. Chunks are
+     * independent, so running them side by side turns N round trips into
+     * roughly one. Keep it modest for a local model, which serialises anyway.
+     */
+    concurrency: number;
+    /**
+     * How long an identical decision (same tool, state, questions, provider) is
+     * served from memory instead of asked again. The bash hook sees the same
+     * command many times in one session; the second answer should cost nothing.
+     * 0 disables the cache.
+     */
+    cacheTtlMs: number;
+    /**
+     * After a provider fails, skip it for this long instead of paying its
+     * timeout again on every call. A down provider should cost one timeout, not
+     * one per decision. 0 disables the cooldown.
+     */
+    providerCooldownMs: number;
   };
   verify: {
     /** At or above this, a claim counts as supported. */
@@ -80,6 +101,35 @@ export interface JevConfig {
      * may or may not call.
      */
     bash: boolean;
+    /**
+     * Let the decision model judge bash commands the rules could not, before
+     * they run. "consequential" asks only about commands that can change
+     * something outside the working tree or are hard to undo (pushes, cloud
+     * CLIs, databases, deploys, in-place edits); "all" asks about every
+     * command the rules left open; "off" leaves that to jev_gate.
+     */
+    model: HookModelMode;
+    /**
+     * When grep, find or ls returns more hits than this, append a one-line hint
+     * to the result pointing at jev_triage. That is the moment the agent
+     * decides what to read next, so it is where a hint changes behaviour.
+     * 0 disables the hint.
+     */
+    triageHintAt: number;
+    /**
+     * Record missed opportunities in the ledger — large search results without a
+     * triage, edits reported without a verify — so /jev can say how much of the
+     * work actually went through the decision layer.
+     */
+    opportunities: boolean;
+  };
+  /**
+   * Add a short section to the system prompt that states when to reach for the
+   * jev_* tools. The per-tool guidelines alone are easy for a model to skim
+   * past; one paragraph describing the workflow is not.
+   */
+  prompt: {
+    inject: boolean;
   };
   shadow: {
     triage: boolean;
@@ -110,6 +160,9 @@ export function defaultConfig(): JevConfig {
       maxKeep: 8,
       minConfidence: 0.5,
       gateTimeoutMs: 2_500,
+      concurrency: 4,
+      cacheTtlMs: 10 * 60 * 1000,
+      providerCooldownMs: 30_000,
     },
     verify: {
       supportedAt: 0.7,
@@ -123,6 +176,12 @@ export function defaultConfig(): JevConfig {
     },
     hook: {
       bash: true,
+      model: "consequential",
+      triageHintAt: 20,
+      opportunities: true,
+    },
+    prompt: {
+      inject: true,
     },
     shadow: {
       triage: false,
@@ -179,6 +238,11 @@ function mergeConfig(raw: unknown): JevConfig {
     verify: { ...base.verify, ...(input.verify ?? {}) },
     gate: normaliseGate(input.gate, base.gate),
     hook: normaliseHook(input.hook, base.hook),
+    prompt: {
+      inject: typeof (input.prompt as { inject?: unknown } | undefined)?.inject === "boolean"
+        ? (input.prompt as { inject: boolean }).inject
+        : base.prompt.inject,
+    },
     shadow: { ...base.shadow, ...(input.shadow ?? {}) },
     ledger: { ...base.ledger, ...(input.ledger ?? {}) },
   };
@@ -210,10 +274,18 @@ function normaliseGate(input: unknown, fallback: Record<RiskClass, GateVerdict>)
  * Only a real boolean counts, so `"false"` cannot quietly leave the hook on and
  * an unexpected value cannot quietly turn it off.
  */
-function normaliseHook(input: unknown, fallback: { bash: boolean }): { bash: boolean } {
+function normaliseHook(input: unknown, fallback: JevConfig["hook"]): JevConfig["hook"] {
   if (!input || typeof input !== "object") return { ...fallback };
   const raw = input as Record<string, unknown>;
-  return { bash: typeof raw.bash === "boolean" ? raw.bash : fallback.bash };
+  const model = raw.model;
+  const hintAt = raw.triageHintAt;
+  return {
+    bash: typeof raw.bash === "boolean" ? raw.bash : fallback.bash,
+    model: model === "off" || model === "consequential" || model === "all" ? model : fallback.model,
+    triageHintAt:
+      typeof hintAt === "number" && Number.isFinite(hintAt) && hintAt >= 0 ? Math.floor(hintAt) : fallback.triageHintAt,
+    opportunities: typeof raw.opportunities === "boolean" ? raw.opportunities : fallback.opportunities,
+  };
 }
 
 export function loadConfig(): JevConfig {

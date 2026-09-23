@@ -235,3 +235,33 @@ describe("path handling", () => {
     assert.equal(configPath(), CONFIG_FILE());
   });
 });
+
+describe("speed and usage settings", () => {
+  it("defaults to a gate that asks the model about consequential commands, quickly", () => {
+    const config = defaultConfig();
+    assert.equal(config.hook.model, "consequential");
+    assert.equal(config.hook.triageHintAt, 20);
+    assert.equal(config.hook.opportunities, true);
+    assert.equal(config.prompt.inject, true);
+    assert.equal(config.limits.concurrency, 4);
+    assert.ok(config.limits.cacheTtlMs > 0);
+    assert.ok(config.limits.providerCooldownMs > 0);
+  });
+
+  it("ignores a hook.model it does not know instead of switching the model off", () => {
+    writeConfig({ hook: { model: "sometimes", triageHintAt: -3 } });
+    const config = loadConfig();
+    assert.equal(config.hook.model, "consequential");
+    assert.equal(config.hook.triageHintAt, 20);
+    assert.equal(config.hook.bash, true);
+  });
+
+  it("takes valid values as given", () => {
+    writeConfig({ hook: { model: "all", triageHintAt: 0, opportunities: false }, prompt: { inject: false } });
+    const config = loadConfig();
+    assert.equal(config.hook.model, "all");
+    assert.equal(config.hook.triageHintAt, 0);
+    assert.equal(config.hook.opportunities, false);
+    assert.equal(config.prompt.inject, false);
+  });
+});

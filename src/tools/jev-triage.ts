@@ -54,6 +54,28 @@ interface TriageParams {
 /** How many noul questions share one provider call. */
 const DEFAULT_QUESTIONS_PER_CALL = 40;
 
+/**
+ * Run `worker` over `items` with at most `limit` in flight, keeping input order
+ * in the output. A tiny pool rather than a dependency: this is the only place
+ * pi-jev needs one.
+ */
+export async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await worker(items[index] as T);
+    }
+  });
+  await Promise.all(lanes);
+  return out;
+}
+
 export function questionFor(index: number, candidate: Candidate, params: TriageParams): QuestionSpec {
   return {
     id: `c${index}`,
@@ -200,14 +222,21 @@ export const JevTriageTool = {
     let degraded = false;
     let partialFailure: string | null = null;
 
-    for (let offset = 0; offset < candidates.length; offset += questionsPerCall) {
+    // Chunks are independent questions over disjoint candidates, so they run side
+    // by side up to `limits.concurrency`. A triage over 200 candidates used to be
+    // five sequential round trips; now it is about one. Results are folded back
+    // in chunk order, so the ranking does not depend on which call returned first.
+    const chunkOffsets: number[] = [];
+    for (let offset = 0; offset < candidates.length; offset += questionsPerCall) chunkOffsets.push(offset);
+
+    type ChunkResult =
+      | { ok: true; offset: number; chunk: Candidate[]; outcome: Awaited<ReturnType<typeof decide>> }
+      | { ok: false; offset: number; error: Error };
+
+    const runChunk = async (offset: number): Promise<ChunkResult> => {
       const chunk = candidates.slice(offset, offset + questionsPerCall);
       const questions = chunk.map((candidate, index) => questionFor(offset + index, candidate, params));
       const stateText = renderCandidatesForState(chunk, config.limits.maxStateChars);
-
-      const chunkKept: string[] = [];
-      const chunkDropped: string[] = [];
-
       try {
         const outcome = await decide({
           tool: "jev_triage",
@@ -221,34 +250,49 @@ export const JevTriageTool = {
           annotate: (answers) => {
             // Filter by the threshold only. The ranking cap is applied later,
             // globally, and is deliberately not recorded as a drop.
+            const kept: string[] = [];
+            const dropped: string[] = [];
             for (const [index, candidate] of chunk.entries()) {
-              const answer = answers[`c${offset + index}`];
-              const p = answer?.p ?? 0;
-              if (p >= minConfidence) chunkKept.push(candidate.key);
-              else chunkDropped.push(candidate.key);
+              const p = answers[`c${offset + index}`]?.p ?? 0;
+              if (p >= minConfidence) kept.push(candidate.key);
+              else dropped.push(candidate.key);
             }
-            return { kept: chunkKept, dropped: chunkDropped };
+            return { kept, dropped };
           },
         });
-
-        decisions.push(outcome.decisionId);
-        provider = outcome.provider;
-        latencyMs += outcome.latencyMs;
-        costUsd += outcome.costUsd;
-        degraded = degraded || outcome.degraded;
-        attempts.push(...outcome.attempts);
-
-        for (const [index, candidate] of chunk.entries()) {
-          const answer = outcome.answers[`c${offset + index}`];
-          scored.push({ item: candidate, p: answer?.p ?? 0, keep: (answer?.p ?? 0) >= minConfidence });
-        }
+        return { ok: true, offset, chunk, outcome };
       } catch (error) {
-        attempts.push({ provider: params.provider ?? "chain", error: (error as Error).message });
-        if (!partialFailure) partialFailure = (error as Error).message;
-        // Keep whatever earlier chunks produced rather than losing the whole
+        return { ok: false, offset, error: error as Error };
+      }
+    };
+
+    const started = Date.now();
+    const results = await mapConcurrent(chunkOffsets, Math.max(1, config.limits.concurrency), runChunk);
+    // Wall-clock, not the sum: with parallel chunks the sum overstates what the
+    // agent actually waited for.
+    const wallMs = Date.now() - started;
+
+    for (const result of results) {
+      if (!result.ok) {
+        attempts.push({ provider: params.provider ?? "chain", error: result.error.message });
+        // Keep whatever other chunks produced rather than losing the whole
         // triage to one bad batch; report the shortfall instead.
+        if (!partialFailure) partialFailure = result.error.message;
+        continue;
+      }
+      const { outcome, chunk, offset } = result;
+      decisions.push(outcome.decisionId);
+      provider = outcome.provider;
+      costUsd += outcome.costUsd;
+      degraded = degraded || outcome.degraded;
+      attempts.push(...outcome.attempts);
+
+      for (const [index, candidate] of chunk.entries()) {
+        const p = outcome.answers[`c${offset + index}`]?.p ?? 0;
+        scored.push({ item: candidate, p, keep: p >= minConfidence });
       }
     }
+    latencyMs = wallMs;
 
     if (scored.length === 0) {
       throw new Error(
