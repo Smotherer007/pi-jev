@@ -19,8 +19,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { getConfig } from "./config.ts";
 import type { LedgerDecision, LedgerEntry, LedgerLabel, LedgerOpportunity, LedgerShadowMiss } from "./types.ts";
+import { TUNING } from "./tuning.ts";
 
 let warnedOnce = false;
 
@@ -95,18 +95,17 @@ function append(entry: LedgerEntry): void {
  * rewrite cost is amortised over megabytes of writes.
  */
 function rotateIfNeeded(file: string): void {
-  const config = getConfig();
   let size = 0;
   try {
     size = fs.statSync(file).size;
   } catch {
     return;
   }
-  if (size <= config.ledger.maxBytes) return;
+  if (size <= TUNING.ledger.maxBytes) return;
 
   try {
     const lines = fs.readFileSync(file, "utf-8").split("\n").filter(Boolean);
-    const kept = lines.slice(-config.ledger.keepEntries);
+    const kept = lines.slice(-TUNING.ledger.keepEntries);
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, kept.length > 0 ? `${kept.join("\n")}\n` : "", "utf-8");
     fs.renameSync(tmp, file);

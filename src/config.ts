@@ -25,7 +25,7 @@ export interface ProviderEntry {
   /** Stable id used in the ledger and by `provider` overrides. */
   id: string;
   kind: ProviderKind;
-  /** Workspace/label, for the TUI and `jev_status`. */
+  /** Workspace/label, for the TUI and `/jev`. */
   name?: string;
   baseUrl?: string;
   apiKey?: string;
@@ -41,42 +41,22 @@ export interface ProviderEntry {
   manual?: boolean;
 }
 
+/**
+ * The configuration a user decides: which provider, which policy, which
+ * automatic step is on, and what is only measured. Tuning numbers live in
+ * `tuning.ts`, out of the way.
+ */
 export interface JevConfig {
   providers: ProviderEntry[];
   limits: {
-    /** Upper bound for the state we hand to a provider. */
-    maxStateChars: number;
-    /** Default cap on survivors for `jev_triage`. */
-    maxKeep: number;
-    /** Default lower bound on probability for acting on an answer. */
+    /** Default lower bound on probability for acting on an answer (triage survivors). */
     minConfidence: number;
     /**
      * Deadline for the gate's model call, in milliseconds. Deliberately short:
-     * the gate sits on the critical path of every consequential action, so a
-     * slow provider must not turn a guardrail into a stall. A local model on
-     * consumer hardware can take tens of seconds to answer, which is fine for
-     * triage and wrong here — on timeout the verdict falls back to "confirm".
+     * the gate sits on the critical path of every consequential action; on
+     * timeout the verdict falls back to "confirm".
      */
     gateTimeoutMs: number;
-    /**
-     * How many provider calls one triage may have in flight at once. Chunks are
-     * independent, so running them side by side turns N round trips into
-     * roughly one. Keep it modest for a local model, which serialises anyway.
-     */
-    concurrency: number;
-    /**
-     * How long an identical decision (same tool, state, questions, provider) is
-     * served from memory instead of asked again. The bash hook sees the same
-     * command many times in one session; the second answer should cost nothing.
-     * 0 disables the cache.
-     */
-    cacheTtlMs: number;
-    /**
-     * After a provider fails, skip it for this long instead of paying its
-     * timeout again on every call. A down provider should cost one timeout, not
-     * one per decision. 0 disables the cooldown.
-     */
-    providerCooldownMs: number;
   };
   verify: {
     /** At or above this, a claim counts as supported. */
@@ -85,99 +65,35 @@ export interface JevConfig {
     refutedAt: number;
   };
   gate: Record<RiskClass, GateVerdict>;
-  /**
-   * The deterministic rules, enforced rather than offered.
-   *
-   * `jev_gate` is advice: it fires only when the model chooses to ask, and a
-   * model that has already decided to run a command is not the party you want
-   * asking on its own behalf. The rules in `guard.ts` need no provider, no key
-   * and no network, so there is nothing to weigh against applying them to every
-   * shell command before it runs.
-   */
+  /** What runs automatically, without the agent having to ask. */
   hook: {
     /**
-     * Apply `hardGuard` to every `bash` call and act on its verdict before the
-     * command runs. Turn it off to go back to the gate being a tool the model
-     * may or may not call.
+     * Apply the deterministic rules to every `bash` call and act on their
+     * verdict before the command runs. A guardrail the model can skip is not a
+     * guardrail. Needs no provider.
      */
     bash: boolean;
     /**
-     * Let the decision model judge bash commands the rules could not, before
-     * they run. "consequential" asks only about commands that can change
-     * something outside the working tree or are hard to undo (pushes, cloud
-     * CLIs, databases, deploys, in-place edits); "all" asks about every
-     * command the rules left open; "off" leaves that to jev_gate.
+     * Let the decision model judge bash commands the rules could not:
+     * "consequential" (pushes, cloud CLIs, databases, deploys…), "all", or "off".
      */
     model: HookModelMode;
-    /**
-     * When grep, find or ls returns more hits than this, append a one-line hint
-     * to the result pointing at jev_triage. That is the moment the agent
-     * decides what to read next, so it is where a hint changes behaviour.
-     * 0 disables the hint.
-     */
-    triageHintAt: number;
-    /**
-     * Record missed opportunities in the ledger — large search results without a
-     * triage, edits reported without a verify — so /jev can say how much of the
-     * work actually went through the decision layer.
-     */
-    opportunities: boolean;
+    /** Point at jev_triage when a grep/find result is large. */
+    triageHint: boolean;
+    /** Cut long bash output to what matters before it enters the context. */
+    trim: boolean;
+    /** Stub earlier tool outputs the current task has moved past. */
+    prune: boolean;
+    /** Add the decision-layer workflow to the system prompt. */
+    prompt: boolean;
   };
-  /**
-   * Add a short section to the system prompt that states when to reach for the
-   * jev_* tools. The per-tool guidelines alone are easy for a model to skim
-   * past; one paragraph describing the workflow is not.
-   */
-  prompt: {
-    inject: boolean;
-  };
-  /**
-   * Long bash output, cut down to the lines that matter before it enters the
-   * context. Head and tail are always kept (that is where commands put their
-   * summary), lines that say error/fail/warn are kept without asking, and the
-   * decision model judges the rest block by block. The full output is saved to
-   * a file the agent is pointed at, so nothing is lost — only not re-sent.
-   */
-  trim: {
-    enabled: boolean;
-    /** Only outputs with at least this many lines are considered. */
-    minLines: number;
-    /** Lines per block the model judges. */
-    blockLines: number;
-    keepHead: number;
-    keepTail: number;
-    /** A block survives at or above this probability. Low on purpose: a wrong drop is the expensive mistake. */
-    minConfidence: number;
-    timeoutMs: number;
-  };
-  /**
-   * Earlier tool outputs that no longer matter, replaced by a one-line stub
-   * before each LLM call. Every turn re-sends the whole context, so an old file
-   * read that is no longer relevant is paid for again on every turn after it.
-   */
-  prune: {
-    enabled: boolean;
-    /** Leave the context alone until it is roughly this large (estimated tokens). */
-    minContextTokens: number;
-    /** Only outputs at least this long are candidates; stubbing a short one saves nothing. */
-    minChars: number;
-    /** Outputs from the most recent turns are never candidates. */
-    keepRecentTurns: number;
-    minConfidence: number;
-    timeoutMs: number;
-  };
+  /** Decide and log, but do not act. For measuring before trusting. */
   shadow: {
     triage: boolean;
     verify: boolean;
     gate: boolean;
     trim: boolean;
     prune: boolean;
-  };
-  ledger: {
-    /** Rotate once the file grows past this. */
-    maxBytes: number;
-    /** Entries kept when rotating. */
-    keepEntries: number;
   };
 }
 
@@ -193,13 +109,8 @@ export function defaultConfig(): JevConfig {
   return {
     providers: [],
     limits: {
-      maxStateChars: 60_000,
-      maxKeep: 8,
       minConfidence: 0.5,
       gateTimeoutMs: 2_500,
-      concurrency: 4,
-      cacheTtlMs: 10 * 60 * 1000,
-      providerCooldownMs: 30_000,
     },
     verify: {
       supportedAt: 0.7,
@@ -214,28 +125,10 @@ export function defaultConfig(): JevConfig {
     hook: {
       bash: true,
       model: "consequential",
-      triageHintAt: 20,
-      opportunities: true,
-    },
-    prompt: {
-      inject: true,
-    },
-    trim: {
-      enabled: true,
-      minLines: 150,
-      blockLines: 25,
-      keepHead: 10,
-      keepTail: 40,
-      minConfidence: 0.3,
-      timeoutMs: 4_000,
-    },
-    prune: {
-      enabled: true,
-      minContextTokens: 40_000,
-      minChars: 2_000,
-      keepRecentTurns: 2,
-      minConfidence: 0.3,
-      timeoutMs: 3_000,
+      triageHint: true,
+      trim: true,
+      prune: true,
+      prompt: true,
     },
     shadow: {
       triage: false,
@@ -245,10 +138,6 @@ export function defaultConfig(): JevConfig {
       // Turn them live with `/jev-shadow trim off` once the misses are boringly low.
       trim: true,
       prune: true,
-    },
-    ledger: {
-      maxBytes: 8 * 1024 * 1024,
-      keepEntries: 5_000,
     },
   };
 }
@@ -292,19 +181,11 @@ function mergeConfig(raw: unknown): JevConfig {
 
   return {
     providers: Array.isArray(input.providers) ? input.providers.filter(isProviderEntry) : base.providers,
-    limits: { ...base.limits, ...(input.limits ?? {}) },
-    verify: { ...base.verify, ...(input.verify ?? {}) },
+    limits: { ...base.limits, ...pickTyped(input.limits, base.limits) },
+    verify: { ...base.verify, ...pickTyped(input.verify, base.verify) },
     gate: normaliseGate(input.gate, base.gate),
     hook: normaliseHook(input.hook, base.hook),
-    prompt: {
-      inject: typeof (input.prompt as { inject?: unknown } | undefined)?.inject === "boolean"
-        ? (input.prompt as { inject: boolean }).inject
-        : base.prompt.inject,
-    },
-    trim: { ...base.trim, ...pickTyped(input.trim, base.trim) },
-    prune: { ...base.prune, ...pickTyped(input.prune, base.prune) },
     shadow: { ...base.shadow, ...pickTyped(input.shadow, base.shadow) },
-    ledger: { ...base.ledger, ...(input.ledger ?? {}) },
   };
 }
 
@@ -348,21 +229,15 @@ function normaliseGate(input: unknown, fallback: Record<RiskClass, GateVerdict>)
 }
 
 /**
- * Only a real boolean counts, so `"false"` cannot quietly leave the hook on and
- * an unexpected value cannot quietly turn it off.
+ * Only a real boolean counts, so `"false"` cannot quietly leave a hook on and an
+ * unexpected value cannot quietly turn one off. `model` takes only its three
+ * values; anything else keeps the default rather than switching the model off.
  */
 function normaliseHook(input: unknown, fallback: JevConfig["hook"]): JevConfig["hook"] {
-  if (!input || typeof input !== "object") return { ...fallback };
-  const raw = input as Record<string, unknown>;
-  const model = raw.model;
-  const hintAt = raw.triageHintAt;
-  return {
-    bash: typeof raw.bash === "boolean" ? raw.bash : fallback.bash,
-    model: model === "off" || model === "consequential" || model === "all" ? model : fallback.model,
-    triageHintAt:
-      typeof hintAt === "number" && Number.isFinite(hintAt) && hintAt >= 0 ? Math.floor(hintAt) : fallback.triageHintAt,
-    opportunities: typeof raw.opportunities === "boolean" ? raw.opportunities : fallback.opportunities,
-  };
+  const out = { ...fallback, ...pickTyped(input, fallback) };
+  const model = (input as { model?: unknown } | null | undefined)?.model;
+  out.model = model === "off" || model === "consequential" || model === "all" ? model : fallback.model;
+  return out;
 }
 
 export function loadConfig(): JevConfig {
@@ -386,7 +261,7 @@ export function loadConfig(): JevConfig {
     cached = mergeConfig(JSON.parse(fs.readFileSync(file, "utf-8")));
   } catch {
     // A corrupt config must not take the extension down; fall back to defaults
-    // and let `jev_status` report it.
+    // and let `/jev` report it.
     cached = defaultConfig();
   }
   return cached;

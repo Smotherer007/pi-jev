@@ -16,6 +16,7 @@ import type {
 } from "../types.ts";
 import { JevProvider } from "./jev.ts";
 import { OpenAICompatProvider } from "./openai-compat.ts";
+import { TUNING } from "../tuning.ts";
 
 export function buildProvider(entry: ProviderEntry): DecisionProvider {
   switch (entry.kind) {
@@ -163,15 +164,15 @@ export async function warmUp(): Promise<void> {
   if (!entry) return;
   try {
     const health = await buildProvider(entry).available();
-    if (!health.ok && config.limits.providerCooldownMs > 0 && /unreachable/i.test(health.detail)) {
-      cooldowns.set(providerKey(entry), Date.now() + config.limits.providerCooldownMs);
+    if (!health.ok && TUNING.providerCooldownMs > 0 && /unreachable/i.test(health.detail)) {
+      cooldowns.set(providerKey(entry), Date.now() + TUNING.providerCooldownMs);
     }
   } catch {
     /* a warm-up is an optimisation; it has nothing to report */
   }
 }
 
-/** Forget cached answers and cooldowns. Test only, and for `/jev-providers`. */
+/** Forget cached answers and cooldowns. Test only. */
 export function _resetDecisionMemory(): void {
   decisionCache.clear();
   cooldowns.clear();
@@ -197,12 +198,12 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
 
   if (chain.length === 0) {
     throw new Error(
-      "No provider configured. Run jev_setup first, or add one by hand to ~/.pi/jev-config.json.",
+      "No provider configured. Ask the user to run /jev-setup, or add one by hand to ~/.pi/jev-config.json.",
     );
   }
 
   const key = cacheKey(options, chain);
-  const hit = cacheGet(key, config.limits.cacheTtlMs);
+  const hit = cacheGet(key, TUNING.cacheTtlMs);
   if (hit) {
     return { ...hit, latencyMs: 0, costUsd: 0, attempts: [], cached: true };
   }
@@ -213,7 +214,7 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
   for (const [index, entry] of chain.entries()) {
     // An explicitly requested provider is always tried: the caller asked for it
     // by name, and skipping it would answer a different question.
-    const remaining = options.providerId ? null : coolingDown(entry, config.limits.providerCooldownMs);
+    const remaining = options.providerId ? null : coolingDown(entry, TUNING.providerCooldownMs);
     if (remaining !== null) {
       attempts.push({
         provider: entry.id,
@@ -285,13 +286,13 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
         attempts,
         fellBack: index > 0,
       };
-      cachePut(key, outcome, config.limits.cacheTtlMs);
+      cachePut(key, outcome, TUNING.cacheTtlMs);
       return outcome;
     } catch (error) {
       attempts.push({ provider: provider.id, error: (error as Error).message });
       // The caller cancelling is not the provider failing, so it earns no cooldown.
-      if (!options.signal?.aborted && config.limits.providerCooldownMs > 0) {
-        cooldowns.set(providerKey(entry), Date.now() + config.limits.providerCooldownMs);
+      if (!options.signal?.aborted && TUNING.providerCooldownMs > 0) {
+        cooldowns.set(providerKey(entry), Date.now() + TUNING.providerCooldownMs);
       }
       // No retry on the same provider: Jev has no idempotency key, so a second
       // attempt may be charged twice. Move along the chain and let the caller
@@ -303,7 +304,7 @@ export async function decide(options: DecideOptions): Promise<DecideOutcome> {
   throw new Error(`Every provider failed.\n${detail}`);
 }
 
-/** Health of the whole configured chain, for `jev_status`. */
+/** Health of the whole configured chain, for `/jev`. */
 export async function chainHealth(): Promise<
   Array<{ entry: ProviderEntry; ok: boolean; detail: string; skipped: boolean }>
 > {

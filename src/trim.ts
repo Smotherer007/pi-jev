@@ -33,6 +33,7 @@ import { newId } from "./ledger.ts";
 import { decide } from "./providers/index.ts";
 import { mapConcurrent } from "./concurrency.ts";
 import type { QuestionSpec } from "./types.ts";
+import { TUNING } from "./tuning.ts";
 
 /** Lines that are kept without asking. Deliberately broad: a false keep costs a few tokens. */
 const SIGNAL =
@@ -183,9 +184,9 @@ export async function trimOutput(
   const none: TrimResult = { decisionIds: [], keptLines: 0, droppedLines: 0, shadow };
 
   const lines = text.split("\n");
-  if (lines.length < config.trim.minLines) return none;
+  if (lines.length < TUNING.trim.minLines) return none;
 
-  const plan = planTrim(lines, Math.max(1, config.trim.blockLines), config.trim.keepHead, config.trim.keepTail);
+  const plan = planTrim(lines, Math.max(1, TUNING.trim.blockLines), TUNING.trim.keepHead, TUNING.trim.keepTail);
   const kept: Array<[number, number]> = [...plan.alwaysKeep];
   const decisionIds: string[] = [];
 
@@ -193,24 +194,24 @@ export async function trimOutput(
     const offsets: number[] = [];
     for (let offset = 0; offset < plan.ask.length; offset += BLOCKS_PER_CALL) offsets.push(offset);
 
-    const results = await mapConcurrent(offsets, Math.max(1, config.limits.concurrency), async (offset) => {
+    const results = await mapConcurrent(offsets, Math.max(1, TUNING.concurrency), async (offset) => {
       const chunk = plan.ask.slice(offset, offset + BLOCKS_PER_CALL);
       try {
         const outcome = await decide({
           tool: "jev_trim",
           purpose: `trim: ${command.slice(0, 120)}`,
-          state: `## COMMAND\n${command}\n\n## OUTPUT BLOCKS\n${renderBlocks(chunk, offset, config.limits.maxStateChars)}`,
+          state: `## COMMAND\n${command}\n\n## OUTPUT BLOCKS\n${renderBlocks(chunk, offset, TUNING.maxStateChars)}`,
           questions: chunk.map((block, index) => blockQuestion(offset + index, block, command)),
           shadow,
           itemCount: chunk.length,
-          timeoutMs: config.trim.timeoutMs,
+          timeoutMs: TUNING.trim.timeoutMs,
           ...(options.signal ? { signal: options.signal } : {}),
           annotate: (answers) => {
             const keptKeys: string[] = [];
             const droppedKeys: string[] = [];
             for (const [index, block] of chunk.entries()) {
               const key = `lines ${block.start + 1}-${block.start + block.lines.length}`;
-              if ((answers[`b${offset + index}`]?.p ?? 1) >= config.trim.minConfidence) keptKeys.push(key);
+              if ((answers[`b${offset + index}`]?.p ?? 1) >= TUNING.trim.minConfidence) keptKeys.push(key);
               else droppedKeys.push(key);
             }
             return { kept: keptKeys, dropped: droppedKeys };
@@ -232,7 +233,7 @@ export async function trimOutput(
       for (const [index, block] of result.chunk.entries()) {
         // A missing answer counts as "keep": no answer is not a verdict.
         const p = result.outcome.answers[`b${result.offset + index}`]?.p ?? 1;
-        if (p >= config.trim.minConfidence) kept.push([block.start, block.start + block.lines.length]);
+        if (p >= TUNING.trim.minConfidence) kept.push([block.start, block.start + block.lines.length]);
       }
     }
   }

@@ -77,9 +77,8 @@ describe("loadConfig", () => {
   it("fills in missing sections from defaults", () => {
     writeConfig({ providers: [jevEntry("key", "jev")] });
     const config = loadConfig();
-    assert.equal(config.limits.maxKeep, 8);
     assert.equal(config.verify.supportedAt, 0.7);
-    assert.equal(config.ledger.maxBytes, 8 * 1024 * 1024);
+    assert.equal(config.hook.trim, true);
   });
 
   it("falls back to defaults for a corrupt file instead of throwing", () => {
@@ -236,32 +235,42 @@ describe("path handling", () => {
   });
 });
 
-describe("speed and usage settings", () => {
-  it("defaults to a gate that asks the model about consequential commands, quickly", () => {
+describe("what runs automatically", () => {
+  it("defaults to the rules and the model on bash, the hint, the prompt, and trim/prune in shadow", () => {
     const config = defaultConfig();
-    assert.equal(config.hook.model, "consequential");
-    assert.equal(config.hook.triageHintAt, 20);
-    assert.equal(config.hook.opportunities, true);
-    assert.equal(config.prompt.inject, true);
-    assert.equal(config.limits.concurrency, 4);
-    assert.ok(config.limits.cacheTtlMs > 0);
-    assert.ok(config.limits.providerCooldownMs > 0);
+    assert.deepEqual(config.hook, {
+      bash: true,
+      model: "consequential",
+      triageHint: true,
+      trim: true,
+      prune: true,
+      prompt: true,
+    });
+    // Able to withhold information, so they start by only measuring.
+    assert.equal(config.shadow.trim, true);
+    assert.equal(config.shadow.prune, true);
+  });
+
+  it("keeps the config to decisions: tuning numbers are not in it", () => {
+    const config = defaultConfig() as unknown as Record<string, unknown>;
+    assert.deepEqual(Object.keys(config).sort(), ["gate", "hook", "limits", "providers", "shadow", "verify"]);
+    assert.deepEqual(Object.keys(config.limits as object).sort(), ["gateTimeoutMs", "minConfidence"]);
   });
 
   it("ignores a hook.model it does not know instead of switching the model off", () => {
-    writeConfig({ hook: { model: "sometimes", triageHintAt: -3 } });
+    writeConfig({ hook: { model: "sometimes", trim: "no" } });
     const config = loadConfig();
     assert.equal(config.hook.model, "consequential");
-    assert.equal(config.hook.triageHintAt, 20);
+    assert.equal(config.hook.trim, true, "a string is not a boolean");
     assert.equal(config.hook.bash, true);
   });
 
-  it("takes valid values as given", () => {
-    writeConfig({ hook: { model: "all", triageHintAt: 0, opportunities: false }, prompt: { inject: false } });
+  it("takes valid values as given, and ignores keys it does not know", () => {
+    writeConfig({ hook: { model: "all", triageHint: false, prune: false }, limits: { maxStateChars: 5 } });
     const config = loadConfig();
     assert.equal(config.hook.model, "all");
-    assert.equal(config.hook.triageHintAt, 0);
-    assert.equal(config.hook.opportunities, false);
-    assert.equal(config.prompt.inject, false);
+    assert.equal(config.hook.triageHint, false);
+    assert.equal(config.hook.prune, false);
+    assert.equal((config.limits as Record<string, unknown>).maxStateChars, undefined);
   });
 });

@@ -16,6 +16,7 @@ import {
   type Msg,
 } from "../src/prune.ts";
 import { stubProvider, withNoulStub, writeConfig } from "./helpers/stub.ts";
+import { _resetTuning, _setTuning } from "../src/tuning.ts";
 
 let home: string;
 
@@ -25,6 +26,9 @@ beforeEach(() => {
   _resetConfigCache();
   _resetDecisionMemory();
   _resetPruneMemory();
+  _resetTuning();
+  // The test conversations are small; the real threshold would never fire.
+  _setTuning({ prune: { minContextTokens: 100 } });
 });
 
 afterEach(() => {
@@ -68,7 +72,6 @@ describe("pruning the context", () => {
   const config = (url: string, extra: Record<string, unknown> = {}) =>
     writeConfig(home, {
       providers: stubProvider(url),
-      prune: { minContextTokens: 100 },
       shadow: { prune: false },
       ...extra,
     });
@@ -118,7 +121,8 @@ describe("pruning the context", () => {
 
   it("does nothing while the context is small", async () => {
     await withNoulStub(verdict, async (url, bodies) => {
-      config(url, { prune: { minContextTokens: 1_000_000 } });
+      config(url);
+      _setTuning({ prune: { minContextTokens: 1_000_000 } });
       const result = await pruneContext(conversation(), home);
       assert.equal(result.messages, undefined);
       assert.equal(bodies.length, 0);
@@ -127,7 +131,7 @@ describe("pruning the context", () => {
 
   it("only measures in shadow mode, which is the default", async () => {
     await withNoulStub(verdict, async (url) => {
-      writeConfig(home, { providers: stubProvider(url), prune: { minContextTokens: 100 } });
+      writeConfig(home, { providers: stubProvider(url) });
       const result = await pruneContext(conversation(), home);
       assert.equal(result.messages, undefined);
       assert.equal(result.elided, 1);

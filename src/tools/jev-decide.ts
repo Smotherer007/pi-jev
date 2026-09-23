@@ -18,6 +18,7 @@ import { decide } from "../providers/index.ts";
 import { normaliseQuestions } from "../questions.ts";
 import { formatAnswer } from "../format.ts";
 import type { QuestionSpec } from "../types.ts";
+import { TUNING } from "../tuning.ts";
 
 interface DecideParams {
   purpose: string;
@@ -87,9 +88,9 @@ export const JevDecideTool = {
     }
 
     const stateChars = params.state.length;
-    if (stateChars > config.limits.maxStateChars) {
+    if (stateChars > TUNING.maxStateChars) {
       throw new Error(
-        `State is ${stateChars} characters, over the ${config.limits.maxStateChars} limit. ` +
+        `State is ${stateChars} characters, over the ${TUNING.maxStateChars} limit. ` +
           "Filter it in code first — accuracy drops as state fills with material unrelated to the decision, and the context window is finite.",
       );
     }

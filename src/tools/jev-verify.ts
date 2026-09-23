@@ -20,6 +20,7 @@ import { collectGitDiff, run } from "../exec.ts";
 import { decide } from "../providers/index.ts";
 import { claimVerdict, formatVerification } from "../format.ts";
 import type { QuestionSpec } from "../types.ts";
+import { TUNING } from "../tuning.ts";
 
 interface VerifyParams {
   claims: string[];
@@ -134,7 +135,7 @@ export const JevVerifyTool = {
     // distrust it corrupts exactly the measurement the ledger exists for.
     const shadow = params.shadow ?? config.shadow.verify;
 
-    const evidence = await gatherEvidence(params, ctx.cwd, config.limits.maxStateChars);
+    const evidence = await gatherEvidence(params, ctx.cwd, TUNING.maxStateChars);
 
     if (evidence.text.trim().length === 0) {
       return {

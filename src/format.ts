@@ -292,7 +292,7 @@ export function formatCalibration(report: CalibrationReport, scope: string): str
   if (report.total === 0) {
     lines.push("No labelled answers in this scope, so there is nothing to measure.");
     lines.push("");
-    lines.push("Label a decision with jev_label once you know how it turned out. Until then, any");
+    lines.push("Label a decision with /jev-label once you know how it turned out. Until then, any");
     lines.push("statement about how well this works would be a guess, which is exactly what the");
     lines.push("ledger exists to avoid.");
     return lines.join("\n");
@@ -344,7 +344,7 @@ function binLabel(bin: ReliabilityBin): string {
   return `${bin.from.toFixed(1)}–${bin.to.toFixed(1)}`;
 }
 
-/** One line summarising a decision, for `jev_label` prompts and listings. */
+/** One line summarising a decision, for `/jev-label` listings. */
 export function summarizeDecision(decision: LedgerDecision): string {
   const answers = decision.answers
     .map((answer) => `${answer.id}=${String(answer.value)}@${answer.p.toFixed(2)}`)

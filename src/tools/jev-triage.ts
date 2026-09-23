@@ -34,6 +34,7 @@ import { decide } from "../providers/index.ts";
 import { mapConcurrent } from "../concurrency.ts";
 import { formatTriage, type TriageRow } from "../format.ts";
 import type { QuestionSpec } from "../types.ts";
+import { TUNING } from "../tuning.ts";
 
 interface TriageParams {
   question: string;
@@ -140,7 +141,7 @@ export const JevTriageTool = {
     ctx: { cwd: string },
   ) {
     const config = getConfig();
-    const maxKeep = params.maxKeep ?? config.limits.maxKeep;
+    const maxKeep = params.maxKeep ?? TUNING.maxKeep;
     const minConfidence = params.minConfidence ?? config.limits.minConfidence;
     const shadow = params.shadow ?? config.shadow.triage;
     const questionsPerCall = Math.max(1, params.questionsPerCall ?? DEFAULT_QUESTIONS_PER_CALL);
@@ -217,7 +218,7 @@ export const JevTriageTool = {
     const runChunk = async (offset: number): Promise<ChunkResult> => {
       const chunk = candidates.slice(offset, offset + questionsPerCall);
       const questions = chunk.map((candidate, index) => questionFor(offset + index, candidate, params));
-      const stateText = renderCandidatesForState(chunk, config.limits.maxStateChars);
+      const stateText = renderCandidatesForState(chunk, TUNING.maxStateChars);
       try {
         const outcome = await decide({
           tool: "jev_triage",
@@ -248,7 +249,7 @@ export const JevTriageTool = {
     };
 
     const started = Date.now();
-    const results = await mapConcurrent(chunkOffsets, Math.max(1, config.limits.concurrency), runChunk);
+    const results = await mapConcurrent(chunkOffsets, Math.max(1, TUNING.concurrency), runChunk);
     // Wall-clock, not the sum: with parallel chunks the sum overstates what the
     // agent actually waited for.
     const wallMs = Date.now() - started;

@@ -10,6 +10,7 @@ import extension, { _disableWarmup, promptSection } from "../index.ts";
 import { _resetConfigCache } from "../src/config.ts";
 import { _resetDecisionMemory } from "../src/providers/index.ts";
 import { _resetTrimMemory } from "../src/trim.ts";
+import { _resetTuning, _setTuning } from "../src/tuning.ts";
 import { _resetPruneMemory } from "../src/prune.ts";
 import { withNoulStub } from "./helpers/stub.ts";
 import { _resetDropMemory, readLedger, rememberDrops } from "../src/ledger.ts";
@@ -101,6 +102,7 @@ beforeEach(() => {
   _resetDecisionMemory();
   _resetTrimMemory();
   _resetPruneMemory();
+  _resetTuning();
   notifications = [];
   statuses = [];
 });
@@ -109,15 +111,8 @@ afterEach(() => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-const EXPECTED_TOOLS = [
-  "jev_setup",
-  "jev_status",
-  "jev_decide",
-  "jev_triage",
-  "jev_verify",
-  "jev_gate",
-  "jev_label",
-];
+// Setup, status and labelling are commands: they are the user's job, not the agent's.
+const EXPECTED_TOOLS = ["jev_decide", "jev_triage", "jev_verify", "jev_gate"];
 
 /**
  * The extension registers two `tool_call` handlers, and the order is part of the
@@ -133,6 +128,19 @@ function toolCallHandler(pi: FakePi, which: "guard" | "shadow"): ToolCallHandler
   const handler = which === "guard" ? handlers[0] : handlers[1];
   assert.ok(handler, `no ${which} tool_call handler was registered`);
   return handler as ToolCallHandler;
+}
+
+/**
+ * Run every handler for an event in registration order, as pi does, and return
+ * the last result any of them gave. For events more than one module listens to.
+ */
+async function emit(pi: FakePi, event: string, payload: unknown, ctx: unknown): Promise<unknown> {
+  let result: unknown;
+  for (const handler of pi.handlers.get(event) ?? []) {
+    const value = await handler(payload, ctx);
+    if (value !== undefined) result = value;
+  }
+  return result;
 }
 
 /** What a guard handler returns when it wants a call stopped. */
@@ -187,7 +195,7 @@ describe("extension factory", () => {
     extension(pi.api as never);
     assert.deepEqual(
       [...pi.commands.keys()].sort(),
-      ["jev", "jev-calibration", "jev-providers", "jev-shadow"],
+      ["jev", "jev-calibration", "jev-label", "jev-setup", "jev-shadow"],
     );
   });
 
@@ -199,7 +207,8 @@ describe("extension factory", () => {
     // dangerous command is refused before anything else looks at it.
     assert.equal(pi.handlers.get("tool_call")?.length, 3);
     assert.equal(pi.handlers.get("before_agent_start")?.length, 1);
-    assert.equal(pi.handlers.get("tool_result")?.length, 1);
+    // The triage hint and trim listen to the same event, in that order.
+    assert.equal(pi.handlers.get("tool_result")?.length, 2);
     assert.equal(pi.handlers.get("agent_end")?.length, 1);
     assert.equal(pi.handlers.get("context")?.length, 1);
   });
@@ -229,7 +238,7 @@ describe("session_start", () => {
     ctx.ui.notify = (text: string) => notifications.push(text);
 
     await pi.handlers.get("session_start")?.[0]?.({ reason: "startup" }, ctx);
-    assert.ok(notifications.some((text) => text.includes("jev_setup")));
+    assert.ok(notifications.some((text) => text.includes("/jev-setup")));
   });
 
   it("does not overwrite an existing config", async () => {
@@ -322,8 +331,8 @@ describe("commands", () => {
     assert.deepEqual(config.shadow, { triage: true, verify: true, gate: true, trim: true, prune: true });
   });
 
-  it("/jev-providers prints the chain", async () => {
-    await runCommand("jev-providers", "");
+  it("/jev prints the chain and the configuration", async () => {
+    await runCommand("jev", "");
     assert.ok(notifications.some((text) => text.includes("pi-jev")));
   });
 });
@@ -893,7 +902,7 @@ describe("the system prompt section", () => {
     extension(pi.api as never);
     assert.equal(await beforeStart(pi)({ systemPrompt: "BASE" }, fakeContext(home)), undefined);
 
-    withProviderConfig({ prompt: { inject: false } });
+    withProviderConfig({ hook: { prompt: false } });
     assert.equal(await beforeStart(pi)({ systemPrompt: "BASE" }, fakeContext(home)), undefined);
   });
 });
@@ -971,11 +980,9 @@ describe("tool activation", () => {
     await pi.handlers.get("session_start")?.[0]?.({ reason: "resume" }, fakeContext(home));
     assert.deepEqual(active, ["read", "bash", "jev_gate"]);
 
-    withProviderConfig();
-    await (pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<unknown>)(
-      { toolName: "jev_setup", isError: false, input: {}, content: [] },
-      fakeContext(home),
-    );
+    // Adding a provider through the command brings the hidden tools back.
+    const setup = pi.commands.get("jev-setup") as { handler: (args: string, ctx: unknown) => Promise<void> };
+    await setup.handler("add openai-compat id=stub url=http://127.0.0.1:1/v1 model=m", fakeContext(home));
     assert.deepEqual([...active].sort(), ["bash", "jev_decide", "jev_gate", "jev_triage", "read"]);
   });
 });
@@ -988,7 +995,8 @@ describe("less context: trim and prune, wired in", () => {
       withProviderConfig({ shadow: { trim: false } }, url);
       const pi = makeFakePi();
       extension(pi.api as never);
-      const onResult = pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<{ content?: Array<{ text?: string }> } | undefined>;
+      const onResult = (e: unknown, c: unknown) =>
+        emit(pi, "tool_result", e, c) as Promise<{ content?: Array<{ text?: string }> } | undefined>;
 
       const result = await onResult(
         { toolName: "bash", isError: false, input: { command: "make" }, content: [{ type: "text", text: longOutput }] },
@@ -1010,7 +1018,7 @@ describe("less context: trim and prune, wired in", () => {
       withProviderConfig({}, url);
       const pi = makeFakePi();
       extension(pi.api as never);
-      const onResult = pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<unknown>;
+      const onResult = (e: unknown, c: unknown) => emit(pi, "tool_result", e, c);
       const result = await onResult(
         { toolName: "bash", isError: false, input: { command: "make" }, content: [{ type: "text", text: longOutput }] },
         fakeContext(home),
@@ -1021,7 +1029,8 @@ describe("less context: trim and prune, wired in", () => {
 
   it("prunes through the context event", async () => {
     await withNoulStub(() => 0.05, async (url) => {
-      withProviderConfig({ shadow: { prune: false }, prune: { minContextTokens: 100 } }, url);
+      withProviderConfig({ shadow: { prune: false } }, url);
+      _setTuning({ prune: { minContextTokens: 100 } });
       const pi = makeFakePi();
       extension(pi.api as never);
       const onContext = pi.handlers.get("context")?.[0] as (e: unknown, c: unknown) => Promise<{ messages?: unknown[] } | undefined>;

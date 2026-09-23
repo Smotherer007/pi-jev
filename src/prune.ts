@@ -28,6 +28,7 @@ import { hashState } from "./ledger.ts";
 import { decide } from "./providers/index.ts";
 import { mapConcurrent } from "./concurrency.ts";
 import type { QuestionSpec } from "./types.ts";
+import { TUNING } from "./tuning.ts";
 
 /** The parts of pi's message shapes this module reads. */
 interface TextPart {
@@ -221,10 +222,10 @@ export interface PruneResult {
 export async function pruneContext(messages: Msg[], cwd: string, signal?: AbortSignal): Promise<PruneResult> {
   const config = getConfig();
   const none: PruneResult = { asked: 0, elided: 0, savedChars: 0 };
-  if (!config.prune.enabled) return none;
-  if (estimateContextTokens(messages) < config.prune.minContextTokens) return none;
+  if (!config.hook.prune) return none;
+  if (estimateContextTokens(messages) < TUNING.prune.minContextTokens) return none;
 
-  const candidates = findCandidates(messages, Math.max(1, config.prune.keepRecentTurns), config.prune.minChars);
+  const candidates = findCandidates(messages, Math.max(1, TUNING.prune.keepRecentTurns), TUNING.prune.minChars);
   if (candidates.length === 0) return none;
 
   const { task, progress } = currentTask(messages);
@@ -238,7 +239,7 @@ export async function pruneContext(messages: Msg[], cwd: string, signal?: AbortS
     const offsets: number[] = [];
     for (let offset = 0; offset < open.length; offset += PER_CALL) offsets.push(offset);
 
-    await mapConcurrent(offsets, Math.max(1, config.limits.concurrency), async (offset) => {
+    await mapConcurrent(offsets, Math.max(1, TUNING.concurrency), async (offset) => {
       const chunk = open.slice(offset, offset + PER_CALL);
       const state = [
         `## CURRENT TASK\n${task || "(unknown)"}`,
@@ -247,7 +248,7 @@ export async function pruneContext(messages: Msg[], cwd: string, signal?: AbortS
         ...chunk.map((candidate, index) => `### O${offset + index}: ${candidate.label}\n${excerpt(candidate.text)}`),
       ]
         .join("\n\n")
-        .slice(0, config.limits.maxStateChars);
+        .slice(0, TUNING.maxStateChars);
 
       try {
         const outcome = await decide({
@@ -257,13 +258,13 @@ export async function pruneContext(messages: Msg[], cwd: string, signal?: AbortS
           questions: chunk.map((candidate, index) => pruneQuestion(offset + index, candidate)),
           shadow,
           itemCount: chunk.length,
-          timeoutMs: config.prune.timeoutMs,
+          timeoutMs: TUNING.prune.timeoutMs,
           ...(signal ? { signal } : {}),
           annotate: (answers) => {
             const kept: string[] = [];
             const dropped: string[] = [];
             for (const [index, candidate] of chunk.entries()) {
-              if ((answers[`o${offset + index}`]?.p ?? 1) >= config.prune.minConfidence) kept.push(candidate.label);
+              if ((answers[`o${offset + index}`]?.p ?? 1) >= TUNING.prune.minConfidence) kept.push(candidate.label);
               else dropped.push(candidate.label);
             }
             return { kept, dropped };
@@ -273,7 +274,7 @@ export async function pruneContext(messages: Msg[], cwd: string, signal?: AbortS
         for (const [index, candidate] of chunk.entries()) {
           const p = outcome.answers[`o${offset + index}`]?.p ?? 1;
           const verdict: Verdict = {
-            elide: p < config.prune.minConfidence,
+            elide: p < TUNING.prune.minConfidence,
             decisionId: outcome.decisionId,
             chars: candidate.text.length,
             label: candidate.label,
