@@ -33,7 +33,11 @@ export async function describeStatus(params: StatusParams = {}): Promise<string>
   lines.push(`config   ${configPath()}`);
   lines.push(`ledger   ${ledgerPath()}`);
   lines.push(
-    `shadow   triage=${config.shadow.triage ? "on" : "off"} verify=${config.shadow.verify ? "on" : "off"} gate=${config.shadow.gate ? "on" : "off"}`,
+    `shadow   ${Object.entries(config.shadow).map(([name, on]) => `${name}=${on ? "on" : "off"}`).join(" ")}`,
+  );
+  lines.push(
+    `trim     ${config.trim.enabled ? "on" : "off"} · outputs ≥ ${config.trim.minLines} lines · keep p ≥ ${config.trim.minConfidence}` +
+      ` · prune ${config.prune.enabled ? "on" : "off"} · context ≥ ~${config.prune.minContextTokens} tokens · outputs ≥ ${config.prune.minChars} chars`,
   );
   lines.push(
     `limits   maxStateChars=${config.limits.maxStateChars} maxKeep=${config.limits.maxKeep} minConfidence=${config.limits.minConfidence} gateTimeoutMs=${config.limits.gateTimeoutMs}`,

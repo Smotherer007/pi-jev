@@ -31,6 +31,7 @@ import { getConfig } from "../config.ts";
 import { generateCandidates, renderCandidatesForState, type Candidate } from "../candidates.ts";
 import { rememberDrops } from "../ledger.ts";
 import { decide } from "../providers/index.ts";
+import { mapConcurrent } from "../concurrency.ts";
 import { formatTriage, type TriageRow } from "../format.ts";
 import type { QuestionSpec } from "../types.ts";
 
@@ -54,27 +55,7 @@ interface TriageParams {
 /** How many noul questions share one provider call. */
 const DEFAULT_QUESTIONS_PER_CALL = 40;
 
-/**
- * Run `worker` over `items` with at most `limit` in flight, keeping input order
- * in the output. A tiny pool rather than a dependency: this is the only place
- * pi-jev needs one.
- */
-export async function mapConcurrent<T, R>(
-  items: readonly T[],
-  limit: number,
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next++;
-      out[index] = await worker(items[index] as T);
-    }
-  });
-  await Promise.all(lanes);
-  return out;
-}
+export { mapConcurrent } from "../concurrency.ts";
 
 export function questionFor(index: number, candidate: Candidate, params: TriageParams): QuestionSpec {
   return {

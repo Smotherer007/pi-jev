@@ -9,6 +9,9 @@ import * as path from "node:path";
 import extension, { _disableWarmup, promptSection } from "../index.ts";
 import { _resetConfigCache } from "../src/config.ts";
 import { _resetDecisionMemory } from "../src/providers/index.ts";
+import { _resetTrimMemory } from "../src/trim.ts";
+import { _resetPruneMemory } from "../src/prune.ts";
+import { withNoulStub } from "./helpers/stub.ts";
 import { _resetDropMemory, readLedger, rememberDrops } from "../src/ledger.ts";
 
 /**
@@ -96,6 +99,8 @@ beforeEach(() => {
   _resetDropMemory();
   // Cached answers and provider cooldowns are process-wide too.
   _resetDecisionMemory();
+  _resetTrimMemory();
+  _resetPruneMemory();
   notifications = [];
   statuses = [];
 });
@@ -196,6 +201,7 @@ describe("extension factory", () => {
     assert.equal(pi.handlers.get("before_agent_start")?.length, 1);
     assert.equal(pi.handlers.get("tool_result")?.length, 1);
     assert.equal(pi.handlers.get("agent_end")?.length, 1);
+    assert.equal(pi.handlers.get("context")?.length, 1);
   });
 });
 
@@ -290,7 +296,7 @@ describe("commands", () => {
     await runCommand("jev-shadow", "all on");
     await runCommand("jev-shadow", "all off");
     const config = JSON.parse(fs.readFileSync(path.join(home, ".pi", "jev-config.json"), "utf-8"));
-    assert.deepEqual(config.shadow, { triage: false, verify: false, gate: false });
+    assert.deepEqual(config.shadow, { triage: false, verify: false, gate: false, trim: false, prune: false });
   });
 
   it("/jev-shadow rejects an unknown target instead of silently doing nothing", async () => {
@@ -307,13 +313,13 @@ describe("commands", () => {
     await runCommand("jev-shadow", "all on");
     await runCommand("jev-shadow", "none");
     const config = JSON.parse(fs.readFileSync(path.join(home, ".pi", "jev-config.json"), "utf-8"));
-    assert.deepEqual(config.shadow, { triage: false, verify: false, gate: false });
+    assert.deepEqual(config.shadow, { triage: false, verify: false, gate: false, trim: false, prune: false });
   });
 
   it("/jev-shadow none on still switches them on, because an explicit state wins", async () => {
     await runCommand("jev-shadow", "none on");
     const config = JSON.parse(fs.readFileSync(path.join(home, ".pi", "jev-config.json"), "utf-8"));
-    assert.deepEqual(config.shadow, { triage: true, verify: true, gate: true });
+    assert.deepEqual(config.shadow, { triage: true, verify: true, gate: true, trim: true, prune: true });
   });
 
   it("/jev-providers prints the chain", async () => {
@@ -971,5 +977,63 @@ describe("tool activation", () => {
       fakeContext(home),
     );
     assert.deepEqual([...active].sort(), ["bash", "jev_decide", "jev_gate", "jev_triage", "read"]);
+  });
+});
+
+describe("less context: trim and prune, wired in", () => {
+  const longOutput = Array.from({ length: 300 }, (_, i) => `step ${i} ok`).join("\n");
+
+  it("trims a long bash result live, and records a miss when the full output is read", async () => {
+    await withNoulStub(() => 0.05, async (url) => {
+      withProviderConfig({ shadow: { trim: false } }, url);
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      const onResult = pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<{ content?: Array<{ text?: string }> } | undefined>;
+
+      const result = await onResult(
+        { toolName: "bash", isError: false, input: { command: "make" }, content: [{ type: "text", text: longOutput }] },
+        fakeContext(home),
+      );
+      const text = result?.content?.at(-1)?.text ?? "";
+      assert.match(text, /omitted by pi-jev/);
+      assert.ok(text.length < longOutput.length / 2);
+
+      const full = /Full output: (\S+)/.exec(text)?.[1] ?? "";
+      await (pi.handlers.get("tool_call") ?? [])[2]?.({ toolName: "read", input: { path: full } }, fakeContext(home));
+      const misses = readLedger().filter((entry) => entry.kind === "shadow-miss");
+      assert.equal(misses.length, 1);
+    });
+  });
+
+  it("leaves bash output alone in shadow mode", async () => {
+    await withNoulStub(() => 0.05, async (url) => {
+      withProviderConfig({}, url);
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      const onResult = pi.handlers.get("tool_result")?.[0] as (e: unknown, c: unknown) => Promise<unknown>;
+      const result = await onResult(
+        { toolName: "bash", isError: false, input: { command: "make" }, content: [{ type: "text", text: longOutput }] },
+        fakeContext(home),
+      );
+      assert.equal(result, undefined);
+    });
+  });
+
+  it("prunes through the context event", async () => {
+    await withNoulStub(() => 0.05, async (url) => {
+      withProviderConfig({ shadow: { prune: false }, prune: { minContextTokens: 100 } }, url);
+      const pi = makeFakePi();
+      extension(pi.api as never);
+      const onContext = pi.handlers.get("context")?.[0] as (e: unknown, c: unknown) => Promise<{ messages?: unknown[] } | undefined>;
+      const messages = [
+        { role: "user", content: "task" },
+        { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "a.ts" } }] },
+        { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "y".repeat(5_000) }] },
+        { role: "assistant", content: [{ type: "text", text: "done with a.ts" }] },
+        { role: "assistant", content: [{ type: "text", text: "next" }] },
+      ];
+      const result = await onContext({ messages }, fakeContext(home));
+      assert.match(JSON.stringify(result?.messages?.[2]), /left out as no longer relevant/);
+    });
   });
 });

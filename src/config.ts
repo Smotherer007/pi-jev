@@ -131,10 +131,47 @@ export interface JevConfig {
   prompt: {
     inject: boolean;
   };
+  /**
+   * Long bash output, cut down to the lines that matter before it enters the
+   * context. Head and tail are always kept (that is where commands put their
+   * summary), lines that say error/fail/warn are kept without asking, and the
+   * decision model judges the rest block by block. The full output is saved to
+   * a file the agent is pointed at, so nothing is lost — only not re-sent.
+   */
+  trim: {
+    enabled: boolean;
+    /** Only outputs with at least this many lines are considered. */
+    minLines: number;
+    /** Lines per block the model judges. */
+    blockLines: number;
+    keepHead: number;
+    keepTail: number;
+    /** A block survives at or above this probability. Low on purpose: a wrong drop is the expensive mistake. */
+    minConfidence: number;
+    timeoutMs: number;
+  };
+  /**
+   * Earlier tool outputs that no longer matter, replaced by a one-line stub
+   * before each LLM call. Every turn re-sends the whole context, so an old file
+   * read that is no longer relevant is paid for again on every turn after it.
+   */
+  prune: {
+    enabled: boolean;
+    /** Leave the context alone until it is roughly this large (estimated tokens). */
+    minContextTokens: number;
+    /** Only outputs at least this long are candidates; stubbing a short one saves nothing. */
+    minChars: number;
+    /** Outputs from the most recent turns are never candidates. */
+    keepRecentTurns: number;
+    minConfidence: number;
+    timeoutMs: number;
+  };
   shadow: {
     triage: boolean;
     verify: boolean;
     gate: boolean;
+    trim: boolean;
+    prune: boolean;
   };
   ledger: {
     /** Rotate once the file grows past this. */
@@ -183,10 +220,31 @@ export function defaultConfig(): JevConfig {
     prompt: {
       inject: true,
     },
+    trim: {
+      enabled: true,
+      minLines: 150,
+      blockLines: 25,
+      keepHead: 10,
+      keepTail: 40,
+      minConfidence: 0.3,
+      timeoutMs: 4_000,
+    },
+    prune: {
+      enabled: true,
+      minContextTokens: 40_000,
+      minChars: 2_000,
+      keepRecentTurns: 2,
+      minConfidence: 0.3,
+      timeoutMs: 3_000,
+    },
     shadow: {
       triage: false,
       verify: false,
       gate: false,
+      // New and able to withhold information, so they start by only measuring.
+      // Turn them live with `/jev-shadow trim off` once the misses are boringly low.
+      trim: true,
+      prune: true,
     },
     ledger: {
       maxBytes: 8 * 1024 * 1024,
@@ -243,9 +301,28 @@ function mergeConfig(raw: unknown): JevConfig {
         ? (input.prompt as { inject: boolean }).inject
         : base.prompt.inject,
     },
-    shadow: { ...base.shadow, ...(input.shadow ?? {}) },
+    trim: { ...base.trim, ...pickTyped(input.trim, base.trim) },
+    prune: { ...base.prune, ...pickTyped(input.prune, base.prune) },
+    shadow: { ...base.shadow, ...pickTyped(input.shadow, base.shadow) },
     ledger: { ...base.ledger, ...(input.ledger ?? {}) },
   };
+}
+
+/**
+ * Take only the keys the defaults know, and only when the value has the same
+ * type as the default. A hand-edited `"minLines": "150"` must not turn every
+ * comparison into a string comparison, and `"enabled": "false"` must not be truthy.
+ */
+function pickTyped<T extends object>(input: unknown, base: T): Partial<T> {
+  if (!input || typeof input !== "object") return {};
+  const out: Partial<T> = {};
+  for (const key of Object.keys(base) as Array<keyof T>) {
+    const value = (input as Record<string, unknown>)[key as string];
+    if (typeof value === typeof base[key] && (typeof value !== "number" || Number.isFinite(value))) {
+      out[key] = value as T[keyof T];
+    }
+  }
+  return out;
 }
 
 function isProviderEntry(value: unknown): value is ProviderEntry {

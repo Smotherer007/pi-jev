@@ -37,6 +37,8 @@ import { hardGuard } from "./src/guard.ts";
 import { classifyWithModel, isConsequential } from "./src/gate-model.ts";
 import { findShadowMiss, readLedger, recordOpportunity, recordShadowMiss } from "./src/ledger.ts";
 import { warmUp } from "./src/providers/index.ts";
+import { trimMissFor, trimOutput } from "./src/trim.ts";
+import { forgetPruneMiss, pruneContext, pruneMissFor, type Msg } from "./src/prune.ts";
 import {
   calibrationReport,
   joinLabels,
@@ -89,7 +91,7 @@ function hasProvider(config: JevConfig): boolean {
  * applies, which is what makes a model reach for the tools at the right moment
  * instead of only when it happens to remember them.
  */
-export function promptSection(active: readonly string[]): string {
+export function promptSection(active: readonly string[], options: { shortening?: boolean } = {}): string {
   const has = (name: string) => active.includes(name);
   const lines = [
     "## Decision layer (pi-jev)",
@@ -115,6 +117,11 @@ export function promptSection(active: readonly string[]): string {
   if (has("jev_decide")) {
     lines.push(
       "- Any other bounded choice (classify, route, yes/no): jev_decide, with every question you already know you need in one call.",
+    );
+  }
+  if (options.shortening) {
+    lines.push(
+      "- Long command output and earlier tool outputs that no longer matter may be shortened. A `[pi-jev: …]` note says what was left out and how to get it back — one tool call, when you actually need it.",
     );
   }
   lines.push("", "The decision model answers; you still reason and write everything the user reads.");
@@ -234,7 +241,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (!active.some((name) => name.startsWith("jev_"))) return;
 
-    return { systemPrompt: `${event.systemPrompt}\n\n${promptSection(active)}` };
+    const shortening =
+      (config.trim.enabled && !config.shadow.trim) || (config.prune.enabled && !config.shadow.prune);
+    return { systemPrompt: `${event.systemPrompt}\n\n${promptSection(active, { shortening })}` };
   });
 
   /**
@@ -391,7 +400,22 @@ export default function (pi: ExtensionAPI) {
    */
   const run = { pendingTriage: [] as string[], edits: 0, verified: false };
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx: ExtensionContext) => {
+    if (event.toolName === "read") {
+      // A read of something trim or prune took out of the context is the one
+      // signal that they withheld something that mattered.
+      const input = event.input as { path?: unknown; file_path?: unknown } | undefined;
+      const target = input?.path ?? input?.file_path;
+      if (typeof target === "string" && target.length > 0) {
+        const trimmed = trimMissFor(target, ctx.cwd);
+        if (trimmed) recordShadowMiss(trimmed, target, "read (trimmed output)");
+        const pruned = pruneMissFor(target, ctx.cwd);
+        if (pruned) {
+          recordShadowMiss(pruned, target, "read again (pruned)");
+          forgetPruneMiss(target, ctx.cwd);
+        }
+      }
+    }
     if (event.toolName === "jev_triage") run.pendingTriage.shift();
     else if (event.toolName === "jev_verify") run.verified = true;
     else if (event.toolName === "edit" || event.toolName === "write") run.edits += 1;
@@ -415,10 +439,14 @@ export default function (pi: ExtensionAPI) {
    * itself, at the moment the agent decides what to read next. One line, and
    * only past the threshold, so a normal search is left alone.
    */
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx: ExtensionContext) => {
     if (event.toolName === "jev_setup") {
       syncActiveTools();
       return;
+    }
+    if (event.toolName === "bash") {
+      const content = await trimBash(event as never, ctx);
+      return content ? { content: content as typeof event.content } : undefined;
     }
     // Not ls: a directory listing is orientation, and a hint on every large one
     // would be noise the model learns to ignore — hints included.
@@ -452,6 +480,50 @@ export default function (pi: ExtensionAPI) {
         },
       ],
     };
+  });
+
+  /* ------------------------------------------- less context, every turn */
+
+  /**
+   * Long bash output, cut to what matters before it enters the context. Failed
+   * commands included: a failing test run is the most common two-thousand-line
+   * output and the one where thirty lines matter.
+   */
+  async function trimBash(
+    event: { content: Array<{ type: string; text?: string }>; input: Record<string, unknown>; details?: unknown },
+    ctx: ExtensionContext,
+  ) {
+    const config = getConfig();
+    if (!config.trim.enabled || !hasProvider(config)) return;
+
+    const text = event.content
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\n");
+    const command = typeof event.input.command === "string" ? event.input.command : "";
+    const details = event.details as { fullOutputPath?: unknown } | undefined;
+    const fullOutputPath = typeof details?.fullOutputPath === "string" ? details.fullOutputPath : undefined;
+
+    const result = await trimOutput(text, command, {
+      ...(fullOutputPath ? { fullOutputPath } : {}),
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    if (!result.text) return;
+
+    return [...event.content.filter((part) => part.type !== "text"), { type: "text" as const, text: result.text }];
+  }
+
+  /**
+   * Earlier outputs that no longer matter, stubbed before each LLM call. The
+   * messages pi hands over are a copy, so this changes what is sent, not the
+   * session: the full history stays on disk and in /tree.
+   */
+  pi.on("context", async (event, ctx: ExtensionContext) => {
+    const config = getConfig();
+    if (!config.prune.enabled || !hasProvider(config)) return;
+    const result = await pruneContext(event.messages as unknown as Msg[], ctx.cwd, ctx.signal);
+    if (!result.messages) return;
+    return { messages: result.messages as unknown as typeof event.messages };
   });
 
   /* ------------------------------------------------------------- commands */
@@ -514,9 +586,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("jev-shadow", {
-    description: "Turn shadow mode on or off: /jev-shadow triage|verify|gate|all|none [on|off]",
+    description: "Turn shadow mode on or off: /jev-shadow triage|verify|gate|trim|prune|all|none [on|off]",
     getArgumentCompletions: (prefix: string) => {
-      const options = ["triage", "verify", "gate", "all", "none"];
+      const options = ["triage", "verify", "gate", "trim", "prune", "all", "none"];
       const filtered = options.filter((option) => option.startsWith(prefix)).map((option) => ({ value: option, label: option }));
       return filtered.length > 0 ? filtered : null;
     },
@@ -543,7 +615,7 @@ export default function (pi: ExtensionAPI) {
         targetRaw === "all" || targetRaw === "none" ? Object.keys(config.shadow) : [targetRaw];
       for (const target of targets) {
         if (!(target in config.shadow)) {
-          const text = `Unknown target "${target}". Use triage, verify, gate, all or none.`;
+          const text = `Unknown target "${target}". Use triage, verify, gate, trim, prune, all or none.`;
           if (ctx.hasUI) ctx.ui.notify(text, "error");
           else process.stdout.write(`${text}\n`);
           return;

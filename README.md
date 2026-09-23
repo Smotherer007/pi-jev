@@ -96,6 +96,8 @@ hosted one is down. Nothing above the provider layer knows which one ran.
 
 Commands: `/jev`, `/jev-calibration`, `/jev-shadow`, `/jev-providers`.
 
+Automatic, no tool call needed: the guard and model check on bash, the triage hint, trim and prune.
+
 ---
 
 ## Three decisions worth explaining
@@ -177,6 +179,36 @@ pi-jev does not rely on the per-tool guidelines alone:
 | **Model in the bash hook** | Consequential commands the rules cannot judge (pushes, cloud CLIs, databases, remote shells, publishes, deploys) are classified by the model *before they run*, with the same policy and fail-safe as `jev_gate`. Everyday local commands never pay for a call. | `hook.model` |
 | **Used vs. missed** | Large search results nobody triaged and edits nobody verified are recorded per agent run. `/jev` shows coverage per tool, so "is it used?" is a number, not a feeling. | `hook.opportunities` |
 | **No dead tools** | Without a provider, `jev_triage`, `jev_verify` and `jev_decide` are hidden instead of failing; `jev_setup` brings them back. Tools you excluded with `-xt` stay excluded. | — |
+
+## Less context on every turn
+
+Every LLM call re-sends the whole conversation, so anything that enters the
+context is paid for again on every later turn. Two automatic steps keep out
+what is not needed. Both start in **shadow mode**: they decide and log, but
+change nothing until you turn them live.
+
+**Trim** — long `bash` output (150+ lines, failed commands included). Head and
+tail are always kept, blocks with a line saying error / fail / warn / traceback
+are kept by regex without a model call, and Jev judges the rest block by block,
+keeping anything it is unsure about. The full output is saved (or pi's own
+saved copy is used) and the agent is told where. Reading that file is recorded
+as a miss.
+
+**Prune** — once the context passes ~40k tokens, earlier tool outputs of 2000+
+characters from before the last two turns are judged against the current task.
+The ones the task has moved past are replaced by a one-line stub saying what was
+there and how to get it back. Verdicts are sticky per task, so each output is
+judged once and the message prefix stays stable for the provider's prompt
+cache. Reading a pruned file again is recorded as a miss. Only what is *sent*
+changes; the session on disk keeps everything.
+
+On any failure both leave the content untouched: here the cost of doing nothing
+is tokens, the cost of doing it wrong is information.
+
+```
+/jev-shadow trim off     # go live once the misses in /jev are boringly low
+/jev-shadow prune off
+```
 
 ## Keeping decisions fast
 
@@ -282,7 +314,15 @@ confidence being invented. Nothing downstream depends on a guess.
     "opportunities": true     // record missed triages and verifies, so /jev shows used vs. missed
   },
   "prompt": { "inject": true }, // add the decision-layer workflow to the system prompt
-  "shadow": { "triage": false, "verify": false, "gate": false },
+  "trim": {                   // long bash output cut to what matters
+    "enabled": true, "minLines": 150, "blockLines": 25,
+    "keepHead": 10, "keepTail": 40, "minConfidence": 0.3, "timeoutMs": 4000
+  },
+  "prune": {                  // earlier outputs that no longer matter, stubbed before each LLM call
+    "enabled": true, "minContextTokens": 40000, "minChars": 2000,
+    "keepRecentTurns": 2, "minConfidence": 0.3, "timeoutMs": 3000
+  },
+  "shadow": { "triage": false, "verify": false, "gate": false, "trim": true, "prune": true },
   "ledger": { "maxBytes": 8388608, "keepEntries": 5000 }
 }
 ```
@@ -300,7 +340,7 @@ guesses. The ledger exists to replace them with measured ones.
 
 ```bash
 npm install
-npm test        # 300 tests, no network required
+npm test        # 318 tests, no network required
 npm run typecheck
 ```
 
@@ -308,6 +348,8 @@ npm run typecheck
 index.ts              tools, commands, event wiring
 src/guard.ts          deterministic risk rules
 src/gate-model.ts     the model half of the gate, shared by jev_gate and the bash hook
+src/trim.ts           long bash output cut to what matters
+src/prune.ts          earlier outputs stubbed once the task has moved past them
 src/candidates.ts     zero-token candidate generation
 src/questions.ts      request building, tolerant answer parsing
 src/calibration.ts    Brier, ECE, reliability, threshold sweep
